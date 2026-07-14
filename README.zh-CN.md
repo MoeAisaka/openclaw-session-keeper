@@ -4,6 +4,17 @@
 
 它会在会话空闲时生成带校验的交接包，再通过 Gateway 官方接口重置物理 `sessionId`，同时保留稳定 `sessionKey`、项目标签、用户手动模型选择、思考等级与非 Fast 设置。
 
+## Token 与费用对比
+
+仓库新增了可配置的阶梯计费估算器。在文档化的 40 轮参考场景中，Keeper 在计入换代后冷启动成本的情况下，将处理 Token 降低 **36.4%**，将 GPT-5.6 Sol 的估算 Codex credits 降低 **36.0%**。这是一组可复算的场景数据，不是对所有工作负载的固定承诺。
+
+```bash
+python3 cost_estimator.py
+python3 cost_estimator.py --json
+```
+
+完整假设、公式、适用边界与官方来源见 [Token 与阶梯计费影响](docs/COST_MODEL.zh-CN.md)。
+
 ## 安全保证
 
 - 运行中的会话绝不重置。
