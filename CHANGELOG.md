@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. The format 
 - Stable session-key continuity with bounded, checksummed handoff state.
 - Preservation and verification of user model, thinking and non-fast preferences.
 - Fail-closed pre-commit, pre-push and CI secret scanning.
+- Provider-configurable token and tiered-pricing estimator with documented OpenAI reference scenario.
 
 ## [0.1.0] - 2026-07-14
 
