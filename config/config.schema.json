@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/openclaw-session-keeper/config.schema.json",
+  "title": "OpenClaw Session Keeper configuration",
+  "type": "object",
+  "required": ["enabled", "sessionsStorePath", "stateRoot", "openclawBin", "thresholds", "sessions"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {"const": 2},
+    "enabled": {"type": "boolean"},
+    "sessionsStorePath": {"type": "string", "minLength": 1},
+    "codexStateDbPath": {"type": ["string", "null"]},
+    "routerStatePath": {"type": "string", "minLength": 1},
+    "workflowTaskDir": {"type": "string", "minLength": 1},
+    "stateRoot": {"type": "string", "minLength": 1},
+    "openclawBin": {"type": "string", "minLength": 1},
+    "nmemBin": {"type": "string", "minLength": 1},
+    "sessionPreferences": {"type": "object"},
+    "visibleContinuity": {"type": "object"},
+    "thresholds": {
+      "type": "object",
+      "required": ["checkpointTokens", "rolloverTokens", "emergencyTokens", "maxPhysicalAgeDays", "minIdleSeconds"],
+      "properties": {
+        "checkpointTokens": {"type": "integer", "minimum": 1},
+        "rolloverTokens": {"type": "integer", "minimum": 1},
+        "emergencyTokens": {"type": "integer", "minimum": 1},
+        "maxPhysicalAgeDays": {"type": "number", "exclusiveMinimum": 0},
+        "minIdleSeconds": {"type": "integer", "minimum": 0}
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["label", "project", "query"]
+      }
+    }
+  }
+}

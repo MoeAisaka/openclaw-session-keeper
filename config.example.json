@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 2,
+  "enabled": true,
+  "sessionsStorePath": "~/.openclaw/agents/main/sessions/sessions.json",
+  "codexStateDbPath": null,
+  "routerStatePath": "~/.openclaw/model-router/session-state.json",
+  "workflowTaskDir": "~/.openclaw/workspace/memory/workflow-ledger/tasks",
+  "stateRoot": "~/.openclaw/session-keeper",
+  "openclawBin": "openclaw",
+  "nmemBin": "nmem",
+  "sessionPreferences": {
+    "thinkingLevel": null,
+    "fastMode": false
+  },
+  "visibleContinuity": {
+    "enabled": true,
+    "label": "Session rollover",
+    "historyCheckLimit": 200,
+    "repairExistingSessionKeys": []
+  },
+  "thresholds": {
+    "checkpointTokens": 190000,
+    "rolloverTokens": 235000,
+    "emergencyTokens": 255000,
+    "maxPhysicalAgeDays": 45,
+    "minIdleSeconds": 120,
+    "recentMessageCount": 12,
+    "recentMessageChars": 30000,
+    "continuityContextChars": 16000
+  },
+  "sessions": {
+    "agent:main:project-example": {
+      "label": "Example project",
+      "project": "example",
+      "query": "example project decisions and next steps",
+      "allowManualModelOverride": true,
+      "preferences": {
+        "thinkingLevel": null,
+        "fastMode": false
+      }
+    }
+  }
+}

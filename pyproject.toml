@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-session-keeper"
+version = "0.1.0"
+description = "Safe physical-session rollover behind stable OpenClaw session keys"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = []
+dependencies = []
+
+[project.scripts]
+openclaw-session-keeper = "session_rollover:main"
+
+[tool.setuptools]
+py-modules = ["session_rollover"]
