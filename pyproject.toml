@@ -14,6 +14,7 @@ dependencies = []
 
 [project.scripts]
 openclaw-session-keeper = "session_rollover:main"
+openclaw-session-cost-estimator = "cost_estimator:main"
 
 [tool.setuptools]
-py-modules = ["session_rollover"]
+py-modules = ["session_rollover", "cost_estimator"]
