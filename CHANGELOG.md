@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Documentation
+
+- Record compatibility validation against the stable OpenClaw `2026.7.1` release.
+
 ## [0.1.1] - 2026-07-15
 
 ### Fixed
