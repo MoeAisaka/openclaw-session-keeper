@@ -2,6 +2,7 @@
 
 test:
 	python3 -m unittest discover -s tests -v
+	node --test tests/*.test.mjs
 
 estimate:
 	python3 cost_estimator.py

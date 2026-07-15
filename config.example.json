@@ -6,6 +6,7 @@
   "routerStatePath": "~/.openclaw/model-router/session-state.json",
   "workflowTaskDir": "~/.openclaw/workspace/memory/workflow-ledger/tasks",
   "stateRoot": "~/.openclaw/session-keeper",
+  "recoveryRoot": "~/.openclaw/session-keeper/recoveries",
   "openclawBin": "openclaw",
   "nmemBin": "nmem",
   "sessionPreferences": {
@@ -22,6 +23,9 @@
     "checkpointTokens": 190000,
     "rolloverTokens": 235000,
     "emergencyTokens": 255000,
+    "checkpointTranscriptBytes": 8388608,
+    "rolloverTranscriptBytes": 16777216,
+    "emergencyTranscriptBytes": 33554432,
     "maxPhysicalAgeDays": 45,
     "minIdleSeconds": 120,
     "recentMessageCount": 12,

@@ -13,7 +13,9 @@
     "routerStatePath": {"type": "string", "minLength": 1},
     "workflowTaskDir": {"type": "string", "minLength": 1},
     "stateRoot": {"type": "string", "minLength": 1},
+    "recoveryRoot": {"type": "string", "minLength": 1},
     "openclawBin": {"type": "string", "minLength": 1},
+    "agentId": {"type": "string", "minLength": 1},
     "nmemBin": {"type": "string", "minLength": 1},
     "sessionPreferences": {"type": "object"},
     "visibleContinuity": {"type": "object"},
@@ -24,6 +26,9 @@
         "checkpointTokens": {"type": "integer", "minimum": 1},
         "rolloverTokens": {"type": "integer", "minimum": 1},
         "emergencyTokens": {"type": "integer", "minimum": 1},
+        "checkpointTranscriptBytes": {"type": "integer", "minimum": 0},
+        "rolloverTranscriptBytes": {"type": "integer", "minimum": 0},
+        "emergencyTranscriptBytes": {"type": "integer", "minimum": 0},
         "maxPhysicalAgeDays": {"type": "number", "exclusiveMinimum": 0},
         "minIdleSeconds": {"type": "integer", "minimum": 0}
       }

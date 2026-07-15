@@ -3,10 +3,14 @@
 - [ ] Confirm the repository was created from the clean staging tree, not a production directory.
 - [ ] Confirm author name/email are appropriate for a public commit.
 - [ ] Run `python3 -m unittest discover -s tests -v`.
+- [ ] Run `npm test`.
+- [ ] Run `npm audit --audit-level=high`.
 - [ ] Run `python3 scripts/secret_scan.py --tracked`.
 - [ ] Run `gitleaks dir --redact --no-banner .`.
 - [ ] Run `gitleaks git --redact --no-banner .` after the first commit.
 - [ ] Inspect `git ls-files` for configuration, state, logs, archives and databases.
 - [ ] Validate the example configuration in a disposable OpenClaw environment.
+- [ ] Verify `memoryFlush.enabled=false` and `qualityGuard.enabled=false` when deterministic compaction is required.
+- [ ] Verify emergency recovery mutates through `sessions.compact --max-lines`, not direct transcript/store writes.
 - [ ] Recheck the OpenClaw compatibility matrix.
 - [ ] Create a signed tag only after CI and secret scanning pass.

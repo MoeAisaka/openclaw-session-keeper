@@ -30,7 +30,7 @@ DEFAULT_CONFIG = Path(
         Path.home() / ".config" / "openclaw-session-keeper" / "config.json",
     )
 ).expanduser()
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 ACTIVE_TASK_STATUSES = {"planned", "in_progress", "waiting", "blocked"}
 IDLE_STATUSES = {None, "", "done", "idle", "killed", "failed", "timed_out", "cancelled"}
 PATH_RE = re.compile(
@@ -477,12 +477,27 @@ class RolloverManager:
     ) -> dict[str, Any]:
         thresholds = {**self.config["thresholds"], **(spec or {}).get("thresholds", {})}
         age_days = self._physical_age_days(entry or {})
-        if tokens >= int(thresholds["emergencyTokens"]):
+        transcript_value = str((entry or {}).get("sessionFile") or "")
+        transcript_path = Path(transcript_value).expanduser() if transcript_value else None
+        try:
+            transcript_bytes = transcript_path.stat().st_size if transcript_path and transcript_path.is_file() else 0
+        except OSError:
+            transcript_bytes = 0
+        emergency_bytes = int(thresholds.get("emergencyTranscriptBytes") or 0)
+        rollover_bytes = int(thresholds.get("rolloverTranscriptBytes") or 0)
+        checkpoint_bytes = int(thresholds.get("checkpointTranscriptBytes") or 0)
+        if emergency_bytes and transcript_bytes >= emergency_bytes:
+            action, reason = "emergency", "emergency_transcript_limit"
+        elif tokens >= int(thresholds["emergencyTokens"]):
             action, reason = "emergency", "emergency_token_limit"
+        elif rollover_bytes and transcript_bytes >= rollover_bytes:
+            action, reason = "rollover", "rollover_transcript_limit"
         elif tokens >= int(thresholds["rolloverTokens"]):
             action, reason = "rollover", "rollover_token_limit"
         elif age_days is not None and age_days >= float(thresholds["maxPhysicalAgeDays"]):
             action, reason = "rollover", "max_physical_age"
+        elif checkpoint_bytes and transcript_bytes >= checkpoint_bytes:
+            action, reason = "checkpoint", "checkpoint_transcript_limit"
         elif tokens >= int(thresholds["checkpointTokens"]):
             action, reason = "checkpoint", "checkpoint_token_limit"
         else:
@@ -491,6 +506,7 @@ class RolloverManager:
             "action": action,
             "reason": reason,
             "physicalAgeDays": round(age_days, 3) if age_days is not None else None,
+            "transcriptBytes": transcript_bytes,
         }
 
     def _gateway_call(
@@ -955,6 +971,7 @@ class RolloverManager:
             "oldSessionId": old_session_id,
             "newSessionId": new_session_id,
             "tokensBefore": tokens,
+            "transcriptBytesBefore": decision["transcriptBytes"],
             "trigger": trigger_override or decision["reason"],
             "physicalAgeDaysBefore": decision["physicalAgeDays"],
             "thinkingLevel": refreshed.get("thinkingLevel"),
