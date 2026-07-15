@@ -9,7 +9,7 @@ const SECRET_PATTERNS = [
   /\b((?:authorization|proxy-authorization|x-api-key|api-key)\s*:\s*)[^\r\n]+/gi,
   /\b((?:cookie|set-cookie)\s*:\s*)[^\r\n]+/gi,
   /(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi,
-  /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+  /\bsk-[A-Za-z0-9_-]{8,}\b/g,
   /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
   /\b(?:gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g,
@@ -62,7 +62,10 @@ export function redactSecrets(value) {
   let text = safeString(value);
   for (const pattern of SECRET_PATTERNS) {
     pattern.lastIndex = 0;
-    text = text.replace(pattern, (match, prefix) => prefix ? `${prefix}[REDACTED]` : "[REDACTED]");
+    text = text.replace(
+      pattern,
+      (_match, prefix) => typeof prefix === "string" && prefix ? `${prefix}[REDACTED]` : "[REDACTED]",
+    );
   }
   return text;
 }

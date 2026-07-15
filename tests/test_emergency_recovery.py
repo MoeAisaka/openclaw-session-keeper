@@ -16,6 +16,9 @@ SPEC.loader.exec_module(MODULE)
 
 class EmergencyRecoveryTests(unittest.TestCase):
     def fixture(self, root: Path):
+        openclaw = root / "openclaw-test"
+        openclaw.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(openclaw, 0o700)
         transcript = root / "session.jsonl"
         records = [{"type": "session", "id": "session-1", "timestamp": "2026-01-01T00:00:00Z"}]
         parent = None
@@ -37,7 +40,7 @@ class EmergencyRecoveryTests(unittest.TestCase):
             "sessionsStorePath": str(sessions),
             "stateRoot": str(root / "state"),
             "recoveryRoot": str(root / "recoveries"),
-            "openclawBin": "openclaw",
+            "openclawBin": str(openclaw),
         }), encoding="utf-8")
         return MODULE.EmergencyRecovery(config), sessions, transcript
 

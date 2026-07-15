@@ -23,6 +23,14 @@ test("redacts common credentials without printing their values", () => {
   assert.ok(!result.includes("B".repeat(32)));
   assert.ok(!result.includes("private-password"));
   assert.ok(!result.includes("Q".repeat(32)));
+  assert.ok(!/\d+\[REDACTED\]/.test(result));
+});
+
+test("redacts truncated OpenAI-style credentials at compaction boundaries", () => {
+  const partialKey = `sk-${"P".repeat(12)}`;
+  const result = redactSecrets(`Retained tail contains ${partialKey}`);
+  assert.ok(!result.includes(partialKey));
+  assert.match(result, /\[REDACTED\]/);
 });
 
 test("redacts JSON credential fields and authentication headers", () => {
