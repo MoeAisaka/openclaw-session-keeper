@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openclaw-session-keeper"
-version = "0.1.0"
+version = "0.1.1"
 description = "Safe physical-session rollover behind stable OpenClaw session keys"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -48,6 +48,15 @@ class RolloverTests(unittest.TestCase):
             path = Path(value) / "events.jsonl"
             MODULE.append_jsonl(path, {"event": "test"})
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_lock_state_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as value:
+            manager = self.make_manager(Path(value))
+            with manager._lock() as acquired:
+                self.assertTrue(acquired)
+            self.assertEqual(manager.state_root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(manager.lock_path.stat().st_mode & 0o777, 0o600)
 
     def test_thresholds(self):
         with tempfile.TemporaryDirectory() as value:
@@ -488,6 +497,34 @@ class RolloverTests(unittest.TestCase):
                 payload = manager.scan()
             ensure_again.assert_not_called()
             self.assertEqual(payload["visibilityRepairs"][0]["status"], "already_verified")
+
+    def test_manual_visibility_repair_live_path_returns_event(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager._update_current("agent:main:project-test", {
+                "status": "active",
+                "oldSessionId": "old-session",
+                "newSessionId": "new-session",
+                "handoffPath": "/tmp/handoff.json",
+            })
+            verified = {
+                "status": "verified",
+                "verification": "injected_and_read_back",
+                "marker": "marker",
+            }
+            with patch.object(
+                manager, "_ensure_visible_continuity", return_value=verified
+            ) as ensure:
+                payload = manager.repair_visibility("agent:main:project-test")
+            ensure.assert_called_once()
+            self.assertEqual(payload["event"], "visibility_notice_repaired")
+            self.assertEqual(payload["visibilityNotice"], verified)
+            current = MODULE.read_json(manager.current_path, {})
+            self.assertEqual(
+                current["sessions"]["agent:main:project-test"]["visibilityNotice"],
+                verified,
+            )
 
     def test_context_is_bounded(self):
         handoff = {
