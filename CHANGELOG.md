@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-15
+
+### Fixed
+
+- Correct the OpenClaw `2026.7.1` hosted-Codex compatibility guidance: native app-server sessions ignore custom compaction provider overrides and own manual compaction.
+- Prevent automatic CLI compaction from racing the periodic physical rollover by documenting and checking a minimum prompt-budget headroom.
+
+### Added
+
+- Add a read-only compatibility checker that detects ignored provider overrides and unsafe compaction/rollover headroom without printing auth-profile values.
+
 ## [0.2.0] - 2026-07-15
 
 ### Added

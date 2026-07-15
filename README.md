@@ -4,7 +4,7 @@ Safe physical-session rollover behind stable OpenClaw project session keys.
 
 Long-running agent sessions eventually become expensive, brittle, or difficult to recover. Session Keeper creates a verified handoff, rotates the physical session only while it is idle, and keeps the stable project entry intact.
 
-Version 0.2 also provides an auth-independent deterministic compaction provider. It prevents a Codex OAuth session from being routed into an API-key-only summarizer and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock.
+Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
 
 ## Measured cost model
 
@@ -52,7 +52,7 @@ formulas, caveats, and official pricing sources.
 
 Tested against the stable OpenClaw `2026.7.1` release. Internal Gateway APIs can change; review the compatibility notes before upgrading OpenClaw.
 
-## OAuth-safe deterministic compaction
+## Hosted-Codex OAuth compatibility
 
 Install the local plugin from a clean checkout:
 
@@ -60,15 +60,14 @@ Install the local plugin from a clean checkout:
 openclaw plugins install .
 ```
 
-Then configure OpenClaw so every compaction stage stays model-free:
+OpenClaw `2026.7.1` native hosted-Codex sessions ignore custom compaction provider overrides. Do not select this plugin globally for those sessions. Let Codex own manual compaction, disable auxiliary model calls, and keep periodic physical rollover far enough below the automatic compaction budget:
 
 ```json
 {
   "agents": {
     "defaults": {
       "compaction": {
-        "provider": "openclaw-session-keeper-deterministic",
-        "reserveTokensFloor": 100000,
+        "reserveTokensFloor": 50000,
         "keepRecentTokens": 30000,
         "maxActiveTranscriptBytes": "16mb",
         "truncateAfterCompaction": true,
@@ -80,16 +79,26 @@ Then configure OpenClaw so every compaction stage stays model-free:
 }
 ```
 
-`memoryFlush` and the safeguard quality guard can make auxiliary LLM calls even when the main summary provider is deterministic. Disable both unless they are explicitly routed to a compatible non-OAuth model. If nmem or another memory plugin already handles durable memory, disabling OpenClaw's model-based memory flush avoids duplicate writes as well.
+For each managed hosted-Codex session, keep at least 50,000 tokens between the automatic prompt budget and Keeper's rollover threshold:
+
+```text
+contextTokens - max(reserveTokens, reserveTokensFloor) - rolloverTokens >= 50000
+```
+
+The margin allows the once-per-minute scanner to rotate the physical session before a new prompt enters the incompatible local fallback path. `memoryFlush` and the safeguard quality guard can make auxiliary LLM calls, so disable both unless they are explicitly routed to a compatible model. If nmem or another memory plugin already handles durable memory, disabling OpenClaw's model-based memory flush also avoids duplicate writes.
 
 Validate the installed plugin and configuration before restarting the Gateway:
 
 ```bash
 openclaw config validate
 openclaw plugins list --json
+python3 compatibility_check.py \
+  --openclaw-config "$HOME/.openclaw/openclaw.json" \
+  --keeper-config "$HOME/.config/openclaw-session-keeper/config.json" \
+  --json
 ```
 
-See [OAuth-safe deterministic compaction](docs/OAUTH_SAFE_COMPACTION.md) for the failure model, production rollout and rollback procedure.
+The deterministic provider remains available for non-native or embedded runtimes that actually honor `registerCompactionProvider`; validate that path with a disposable session before enabling it. See [OAuth-safe compaction compatibility](docs/OAUTH_SAFE_COMPACTION.md) for the failure model, production rollout and rollback procedure.
 
 ## Quick start
 
