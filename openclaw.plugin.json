@@ -1,0 +1,30 @@
+{
+  "id": "openclaw-session-keeper",
+  "name": "OpenClaw Session Keeper",
+  "description": "Auth-independent deterministic compaction provider for long-running OpenClaw sessions.",
+  "version": "0.2.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxSummaryChars": {
+        "type": "integer",
+        "minimum": 8000,
+        "maximum": 120000,
+        "default": 40000
+      },
+      "maxItemsPerSection": {
+        "type": "integer",
+        "minimum": 4,
+        "maximum": 40,
+        "default": 18
+      },
+      "maxItemChars": {
+        "type": "integer",
+        "minimum": 300,
+        "maximum": 5000,
+        "default": 1600
+      }
+    }
+  }
+}

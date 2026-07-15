@@ -1,0 +1,19 @@
+{
+  "name": "openclaw-session-keeper",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Safe long-session compaction and physical rollover for OpenClaw",
+  "main": "src/index.js",
+  "openclaw": {
+    "extensions": [
+      "./src/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.7.1"
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

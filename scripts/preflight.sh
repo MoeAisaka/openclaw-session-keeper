@@ -4,8 +4,9 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
-python3 -m py_compile session_rollover.py cost_estimator.py scripts/secret_scan.py
+python3 -m py_compile session_rollover.py emergency_recovery.py cost_estimator.py scripts/secret_scan.py
 python3 -m unittest discover -s tests -v
+node --test tests/*.test.mjs
 python3 scripts/secret_scan.py --self-test
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

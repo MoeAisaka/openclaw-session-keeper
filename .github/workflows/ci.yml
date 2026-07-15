@@ -18,6 +18,13 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m py_compile session_rollover.py scripts/secret_scan.py
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.0.0
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high
+      - run: python -m py_compile session_rollover.py emergency_recovery.py scripts/secret_scan.py
       - run: python -m unittest discover -s tests -v
+      - run: node --test tests/*.test.mjs
       - run: python scripts/secret_scan.py --tracked
