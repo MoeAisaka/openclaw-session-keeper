@@ -46,7 +46,7 @@ formulas, caveats, and official pricing sources.
 - Optional: nmem for semantic recall
 - Optional: Codex app-server state inspection
 
-Tested against OpenClaw `2026.7.1-beta.6`. Internal Gateway APIs can change; review the compatibility notes before upgrading OpenClaw.
+Tested against the stable OpenClaw `2026.7.1` release. Internal Gateway APIs can change; review the compatibility notes before upgrading OpenClaw.
 
 ## Quick start
 
