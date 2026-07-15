@@ -15,6 +15,8 @@ python3 cost_estimator.py --json
 
 完整假设、公式、适用边界与官方来源见 [Token 与阶梯计费影响](docs/COST_MODEL.zh-CN.md)。
 
+当前版本已在 OpenClaw 稳定版 `2026.7.1` 上完成兼容性验证。OpenClaw 内部 Gateway API 后续可能变化，升级 OpenClaw 后应先执行 dry-run 与完整预检。
+
 ## 安全保证
 
 - 运行中的会话绝不重置。
