@@ -4,7 +4,7 @@
 
 它会在会话空闲时生成带校验的交接包，再通过 Gateway 官方接口重置物理 `sessionId`，同时保留稳定 `sessionKey`、项目标签、用户手动模型选择、思考等级与非 Fast 设置。
 
-V0.2 新增不依赖模型认证的确定性压缩 Provider：避免把 Codex OAuth 会话交给仅接受 API Key 的摘要器，并将超大会话恢复纳入 OpenClaw Gateway 生命周期锁。
+V0.2 新增了面向兼容内嵌 Runtime 的确定性压缩 Provider，并将超大会话恢复纳入 OpenClaw Gateway 生命周期锁。原生托管 Codex 会话由 OpenClaw `2026.7.1` 自行接管压缩，必须按下述兼容策略配置。
 
 ## Token 与费用对比
 
@@ -29,7 +29,7 @@ python3 cost_estimator.py --json
 - 确定性摘要采用有界单遍处理，不会为整段超大转录再复制一份标准化消息数组。
 - 应急恢复先完成私有备份和哈希校验，再调用官方 `sessions.compact --max-lines`；不会直接改写活动转录或 `sessions.json`。
 
-## OAuth 安全的确定性压缩
+## 托管 Codex OAuth 兼容策略
 
 从干净仓库安装插件：
 
@@ -37,15 +37,14 @@ python3 cost_estimator.py --json
 openclaw plugins install .
 ```
 
-随后将 OpenClaw 压缩链路配置为全程不调用模型：
+OpenClaw `2026.7.1` 会忽略原生托管 Codex 会话的自定义压缩 Provider。这类会话不应全局指定本插件 Provider；手动压缩交给 Codex 原生链路，同时关闭辅助模型调用，并让物理会话换代充分早于自动压缩预算：
 
 ```json
 {
   "agents": {
     "defaults": {
       "compaction": {
-        "provider": "openclaw-session-keeper-deterministic",
-        "reserveTokensFloor": 100000,
+        "reserveTokensFloor": 50000,
         "keepRecentTokens": 30000,
         "maxActiveTranscriptBytes": "16mb",
         "truncateAfterCompaction": true,
@@ -57,7 +56,24 @@ openclaw plugins install .
 }
 ```
 
-即使主摘要 Provider 是确定性的，`memoryFlush` 与 safeguard 质量审计仍可能额外调用模型。除非已明确为它们配置兼容的非 OAuth 模型，否则必须关闭。当前若由 nmem 等插件承担长期记忆，关闭 OpenClaw 的模型式 memory flush 还能避免重复写入。
+每个被 Keeper 管理的托管 Codex 会话至少保留 50,000 Token 安全余量：
+
+```text
+contextTokens - max(reserveTokens, reserveTokensFloor) - rolloverTokens >= 50000
+```
+
+这段余量用于确保每分钟扫描的换代器能在新 Prompt 进入不兼容的本地回退链路之前先完成物理换代。`memoryFlush` 与 safeguard 质量审计仍可能额外调用模型，除非已明确路由到兼容模型，否则应关闭。当前若由 nmem 等插件承担长期记忆，关闭 OpenClaw 的模型式 memory flush 还能避免重复写入。
+
+修改配置前先执行只读兼容检查：
+
+```bash
+python3 compatibility_check.py \
+  --openclaw-config "$HOME/.openclaw/openclaw.json" \
+  --keeper-config "$HOME/.config/openclaw-session-keeper/config.json" \
+  --json
+```
+
+确定性 Provider 仍可用于确实支持 `registerCompactionProvider` 的非原生或内嵌 Runtime，但启用前必须用一次性会话验证。
 
 完整部署、验证、故障恢复与回滚方法见 [OAuth 安全的确定性压缩](docs/OAUTH_SAFE_COMPACTION.zh-CN.md)。
 

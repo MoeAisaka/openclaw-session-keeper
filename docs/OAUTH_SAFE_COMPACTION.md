@@ -1,28 +1,21 @@
-# OAuth-safe deterministic compaction
+# OAuth-safe compaction compatibility
 
-## Problem
+## Failure model
 
-An OpenClaw session may authenticate to a hosted Codex runtime with OAuth while a built-in summarizer expects an OpenAI API-key profile. Sending that OAuth profile to an API-key-only compaction path fails before the summary is produced. A very large transcript can then remain mapped to the same session and repeatedly hit the context limit.
+OpenClaw can authenticate a hosted Codex runtime with OAuth while its local transcript fallback resolves an `openai-responses` summarizer that accepts API-key profiles only. On OpenClaw `2026.7.1`, native Codex app-server sessions own manual compaction and ignore custom compaction provider overrides. During automatic pre-turn compaction the native backend can decline the non-manual request, after which the local fallback resolves authentication before an extension provider can run. An OAuth profile then fails with an API-key requirement.
 
-There are three possible LLM call sites to account for:
+The failure is an ordering and compatibility issue in the host lifecycle. Selecting `openclaw-session-keeper-deterministic` globally does not fix native hosted-Codex sessions and produces an explicit "compaction overrides ignored" warning.
 
-1. the main compaction summary provider;
-2. the pre-compaction memory flush;
-3. the safeguard summary quality audit.
+## Safe hosted-Codex configuration
 
-Replacing only the first call site is insufficient.
-
-## Safe configuration
-
-Use `openclaw-session-keeper-deterministic` as the provider and disable both auxiliary model call sites:
+Do not set `agents.defaults.compaction.provider` globally when native hosted-Codex OAuth sessions are present. Keep auxiliary model calls disabled and leave enough space for physical rollover to win before the automatic pre-turn budget is reached:
 
 ```json
 {
   "agents": {
     "defaults": {
       "compaction": {
-        "provider": "openclaw-session-keeper-deterministic",
-        "reserveTokensFloor": 100000,
+        "reserveTokensFloor": 50000,
         "keepRecentTokens": 30000,
         "maxActiveTranscriptBytes": "16mb",
         "truncateAfterCompaction": true,
@@ -34,38 +27,48 @@ Use `openclaw-session-keeper-deterministic` as the provider and disable both aux
 }
 ```
 
-The provider performs a bounded one-pass extraction of recent user goals, assistant outcomes, failures and opaque references. Common credential patterns are redacted before output, but no pattern-based filter is perfect: protect the resulting summary as sensitive session data. The provider does not call a model, read provider credentials or log transcript content.
+For every managed hosted-Codex session:
+
+```text
+contextTokens - max(reserveTokens, reserveTokensFloor) - rolloverTokens >= 50000
+```
+
+This is a scheduling margin, not additional model capacity. A larger incoming prompt or system prompt can consume it, so review the result after model-window or system-prompt changes.
+
+Run the read-only check before deployment:
+
+```bash
+python3 compatibility_check.py \
+  --openclaw-config "$HOME/.openclaw/openclaw.json" \
+  --keeper-config "$HOME/.config/openclaw-session-keeper/config.json" \
+  --json
+```
+
+The checker reports counts and thresholds but never returns auth-profile values.
+
+## Deterministic provider boundary
+
+The plugin still registers `openclaw-session-keeper-deterministic`. It performs a bounded one-pass extraction of recent user goals, outcomes, failures and opaque references without calling a model or reading provider credentials. Use it only with an embedded or non-native runtime that honors `registerCompactionProvider`, and validate the exact OpenClaw version with a disposable session before selection.
+
+Pattern-based redaction is best effort. Protect every resulting summary as sensitive session data.
 
 ## Production rollout
 
-1. Back up the active OpenClaw configuration and session index to an owner-only directory.
-2. Install from a reviewed clean checkout with `openclaw plugins install .`.
-3. Apply the safe configuration and run `openclaw config validate`.
-4. Restart the Gateway once and verify its PID remains stable.
-5. Confirm the plugin is loaded and the configured provider id resolves.
-6. Create a disposable session that retains the real OAuth profile, inject synthetic messages, and run `openclaw sessions compact <key> --json`.
-7. Confirm compaction succeeds without adding or switching to an API key.
-8. Delete the disposable session and run the repository secret gates.
-
-The release was validated against OpenClaw `2026.7.1` with a disposable hosted-Codex OAuth session: the deterministic provider completed `/compact`, the same stable session key continued on its original model, and no API-key profile or fallback was used.
+1. Back up the active OpenClaw configuration, Keeper configuration and session index to an owner-only directory.
+2. Run `compatibility_check.py` against the live files and review every finding.
+3. Apply the hosted-Codex configuration and safe rollover thresholds.
+4. Run `openclaw config validate` and Keeper `scan --dry-run`.
+5. Restart the Gateway once; confirm health, plugin loading and stable process state.
+6. Verify no new API-key compaction error or ignored-provider warning appears.
+7. Run a normal turn in a disposable OAuth session. Manual compaction, if tested, must remain on the native Codex path.
+8. Run the repository tests and secret gates.
 
 ## Emergency recovery
 
-For an already oversized inactive session, `emergency_recovery.py`:
+For an already oversized inactive session, `emergency_recovery.py` verifies idle state, backs up the transcript and session entry, verifies SHA-256, and calls the Gateway-owned `sessions.compact --max-lines` lifecycle API. It never rewrites an active transcript or `sessions.json` directly.
 
-1. verifies that the Gateway reports no active run;
-2. validates the transcript chain;
-3. copies the transcript and session entry to an owner-only recovery directory and verifies SHA-256;
-4. calls `openclaw sessions compact <key> --max-lines N --json`;
-5. reloads the Gateway-owned state and verifies that line count and bytes decreased;
-6. writes a metadata-only manifest.
-
-It deliberately does not rewrite the live transcript or `sessions.json`. Direct writes race the Gateway and can corrupt lifecycle state.
-
-The recovery CLI currently targets POSIX systems because it uses an advisory `flock`. Its configuration, session index and transcript must be regular files owned by the current user and must not be group- or world-writable. A stale stored `running` value is reported as `storedStatusStale`; the Gateway runtime status remains authoritative and the tool never patches private OpenClaw state directly.
+The recovery CLI targets POSIX systems because it uses an advisory `flock`. Its inputs must be regular files owned by the current user and not writable by group or others. A stale stored `running` value is reported as `storedStatusStale`; the Gateway runtime remains authoritative.
 
 ## Rollback
 
-Restore the previous OpenClaw configuration, disable the plugin entry, restart the Gateway once, and verify health. Recovery backups contain private transcripts and must never be attached to issues or committed to Git.
-
-If this provider is not installed and selected, do not run model-based `/compact` on an OAuth session until the active OpenClaw version is known to route that authentication profile to a compatible summarizer. With the provider selected and both auxiliary call sites disabled, `/compact` follows the deterministic path documented above.
+Restore the previous OpenClaw and Keeper configurations, restore the previous plugin version if it changed, restart the Gateway once, and verify health. Recovery backups contain private transcripts and must never be attached to issues or committed to Git.
