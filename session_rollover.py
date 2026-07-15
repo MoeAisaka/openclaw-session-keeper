@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,7 +30,7 @@ DEFAULT_CONFIG = Path(
         Path.home() / ".config" / "openclaw-session-keeper" / "config.json",
     )
 ).expanduser()
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 ACTIVE_TASK_STATUSES = {"planned", "in_progress", "waiting", "blocked"}
 IDLE_STATUSES = {None, "", "done", "idle", "killed", "failed", "timed_out", "cancelled"}
 PATH_RE = re.compile(
@@ -46,12 +46,18 @@ DEFAULT_VISIBLE_CONTINUITY = {
 }
 
 
+def ensure_private_dir(path: Path) -> None:
+    """Create a state directory and keep it private under any process umask."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -67,7 +73,7 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
 
 def atomic_write_text(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -89,7 +95,7 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def append_jsonl(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     with path.open("a", encoding="utf-8") as handle:
         os.chmod(path, 0o600)
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -364,7 +370,7 @@ class RolloverManager:
         binding_key = codex_binding_store_key(session_key)
         uri = f"{database_path.resolve().as_uri()}?mode=ro"
         try:
-            with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+            with closing(sqlite3.connect(uri, uri=True, timeout=2)) as connection:
                 row = connection.execute(
                     """
                     SELECT value_json, created_at
@@ -398,8 +404,9 @@ class RolloverManager:
 
     @contextmanager
     def _lock(self):
-        self.state_root.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.state_root)
         with self.lock_path.open("a+", encoding="utf-8") as lock:
+            os.chmod(self.lock_path, 0o600)
             try:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -723,7 +730,7 @@ class RolloverManager:
         handoff["continuityContext"] = render_continuity_context(
             handoff, int(thresholds["continuityContextChars"])
         )
-        archive_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(archive_dir)
         transcript_copy = archive_dir / "transcript.jsonl"
         shutil.copy2(transcript, transcript_copy)
         os.chmod(transcript_copy, 0o600)
@@ -1018,6 +1025,10 @@ class RolloverManager:
 
         if dry_run:
             return run()
+        with self._lock() as acquired:
+            if not acquired:
+                return {"sessionKey": session_key, "action": "lock_busy"}
+            return run()
 
     def _repair_existing_visibility_notices(self, *, dry_run: bool) -> list[dict[str, Any]]:
         config = self._visible_continuity_config()
@@ -1082,10 +1093,6 @@ class RolloverManager:
                         **error,
                     })
         return results
-        with self._lock() as acquired:
-            if not acquired:
-                return {"sessionKey": session_key, "action": "lock_busy"}
-            return run()
 
     def scan(self, *, dry_run: bool = False) -> dict[str, Any]:
         if not self.config.get("enabled", False):
