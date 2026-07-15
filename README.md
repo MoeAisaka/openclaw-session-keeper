@@ -4,6 +4,22 @@ Safe physical-session rollover behind stable OpenClaw project session keys.
 
 Long-running agent sessions eventually become expensive, brittle, or difficult to recover. Session Keeper creates a verified handoff, rotates the physical session only while it is idle, and keeps the stable project entry intact.
 
+## Measured cost model
+
+The repository includes a provider-configurable estimator for repeated context
+tokens and long-context price tiers. In the documented 40-turn reference
+scenario, Keeper reduces processed tokens by **36.4%** and estimated GPT-5.6
+Sol Codex credits by **36.0%**, including the uncached cold-start cost after
+rollover. This is a reproducible scenario, not a universal savings claim.
+
+```bash
+python3 cost_estimator.py
+python3 cost_estimator.py --json
+```
+
+See [Token and tiered-pricing impact](docs/COST_MODEL.md) for assumptions,
+formulas, caveats, and official pricing sources.
+
 ## What it preserves
 
 - Stable `sessionKey` and project label
@@ -74,6 +90,8 @@ The hooks fail closed when gitleaks is missing. Findings print only file, line a
 ## Documentation
 
 - [Chinese README](README.zh-CN.md)
+- [Token and tiered-pricing impact](docs/COST_MODEL.md)
+- [中文 Token 与阶梯计费说明](docs/COST_MODEL.zh-CN.md)
 - [Security policy](SECURITY.md)
 - [Release checklist](RELEASE_CHECKLIST.md)
 - [Changelog](CHANGELOG.md)

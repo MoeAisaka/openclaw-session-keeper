@@ -1,7 +1,10 @@
-.PHONY: test scan preflight
+.PHONY: test estimate scan preflight
 
 test:
 	python3 -m unittest discover -s tests -v
+
+estimate:
+	python3 cost_estimator.py
 
 scan:
 	python3 scripts/secret_scan.py .
