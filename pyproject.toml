@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openclaw-session-keeper"
-version = "0.1.1"
+version = "0.2.0"
 description = "Safe physical-session rollover behind stable OpenClaw session keys"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,4 +17,4 @@ openclaw-session-keeper = "session_rollover:main"
 openclaw-session-cost-estimator = "cost_estimator:main"
 
 [tool.setuptools]
-py-modules = ["session_rollover", "cost_estimator"]
+py-modules = ["session_rollover", "emergency_recovery", "cost_estimator"]

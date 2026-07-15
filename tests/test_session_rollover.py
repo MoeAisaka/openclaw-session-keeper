@@ -31,6 +31,9 @@ class RolloverTests(unittest.TestCase):
                 "checkpointTokens": 210000,
                 "rolloverTokens": 260000,
                 "emergencyTokens": 320000,
+                "checkpointTranscriptBytes": 1000,
+                "rolloverTranscriptBytes": 2000,
+                "emergencyTranscriptBytes": 3000,
                 "maxPhysicalAgeDays": 45,
                 "minIdleSeconds": 120,
                 "recentMessageCount": 12,
@@ -65,6 +68,21 @@ class RolloverTests(unittest.TestCase):
             self.assertEqual(manager._action(210000), "checkpoint")
             self.assertEqual(manager._action(260000), "rollover")
             self.assertEqual(manager._action(320000), "emergency")
+
+    def test_transcript_size_can_trigger_checkpoint_rollover_and_emergency(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            transcript = root / "session.jsonl"
+            entry = {"sessionFile": str(transcript)}
+            transcript.write_bytes(b"x" * 1000)
+            self.assertEqual(manager._decision(1, entry)["reason"], "checkpoint_transcript_limit")
+            transcript.write_bytes(b"x" * 2000)
+            self.assertEqual(manager._decision(1, entry)["reason"], "rollover_transcript_limit")
+            transcript.write_bytes(b"x" * 3000)
+            decision = manager._decision(1, entry)
+            self.assertEqual(decision["reason"], "emergency_transcript_limit")
+            self.assertEqual(decision["transcriptBytes"], 3000)
 
     def test_session_thresholds_override_global_context_policy(self):
         with tempfile.TemporaryDirectory() as value:
