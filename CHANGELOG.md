@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-15
+
+### Fixed
+
+- Fix live `repair-visibility` so it runs under the process lock and returns the repair event.
+- Enforce owner-only permissions on Keeper state directories and lock files.
+- Explicitly close read-only SQLite connections after Codex binding checks.
+
 ### Added
 
 - Clean public-source baseline for verified OpenClaw physical-session rollover.
