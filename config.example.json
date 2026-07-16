@@ -38,6 +38,7 @@
       "project": "example",
       "query": "example project decisions and next steps",
       "allowManualModelOverride": true,
+      "allowManualFastMode": true,
       "preferences": {
         "thinkingLevel": null,
         "fastMode": false

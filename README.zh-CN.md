@@ -2,7 +2,7 @@
 
 在稳定 OpenClaw 项目入口背后安全轮换物理会话。
 
-它会在会话空闲时生成带校验的交接包，再通过 Gateway 官方接口重置物理 `sessionId`，同时保留稳定 `sessionKey`、项目标签、用户手动模型选择、思考等级与非 Fast 设置。
+它会在会话空闲时生成带校验的交接包，再通过 Gateway 官方接口重置物理 `sessionId`，同时保留稳定 `sessionKey`、项目标签、用户手动模型选择、思考等级，以及显式启用后的当前 Standard/Fast 选择。
 
 V0.2 新增了面向兼容内嵌 Runtime 的确定性压缩 Provider，并将超大会话恢复纳入 OpenClaw Gateway 生命周期锁。原生托管 Codex 会话由 OpenClaw `2026.7.1` 自行接管压缩，必须按下述兼容策略配置。
 
@@ -87,6 +87,8 @@ python3 session_rollover.py scan --dry-run
 ```
 
 先用自己的稳定会话替换示例项，确认 dry-run 正常后再执行真实扫描。
+
+`allowManualFastMode` 需要按会话显式开启。配置中的 `fastMode` 仍是默认值；开启后，Keeper 会在巡检和物理换代时保留用户当前选择的布尔值，而不会再次把显式 Fast 选择强制改回默认 Standard。无人值守任务和必须固定 Standard 的角色 Agent 不应开启此选项。
 
 应急恢复默认只预览：
 

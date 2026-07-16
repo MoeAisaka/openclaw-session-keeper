@@ -29,7 +29,7 @@ formulas, caveats, and official pricing sources.
 - Recent visible user/assistant context without tool payloads
 - Active workflow references and optional nmem recall
 - User-selected provider/model overrides
-- Thinking and non-fast execution preferences
+- Thinking preferences and, when explicitly enabled, the user's current Standard/Fast choice
 - An idempotent, operator-visible rollover notice
 
 ## Safety model
@@ -109,6 +109,12 @@ python3 session_rollover.py --config "$HOME/.config/openclaw-session-keeper/conf
 ```
 
 Edit the copied configuration and replace only the example session entry. Never put provider keys in this file; the tool does not need them.
+
+`allowManualFastMode` is opt-in per managed session. The configured `fastMode`
+value remains the default; when enabled, Keeper preserves the current boolean
+session value across scans and physical rollover instead of forcing the default
+back onto an explicit user choice. Keep the option disabled for unattended or
+role-agent sessions that must always run in Standard mode.
 
 Run a real scan only after the dry run is clean:
 
