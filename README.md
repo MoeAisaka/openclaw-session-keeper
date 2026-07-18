@@ -4,7 +4,7 @@ Safe physical-session rollover behind stable OpenClaw project session keys.
 
 Long-running agent sessions eventually become expensive, brittle, or difficult to recover. Session Keeper creates a verified handoff, rotates the physical session only while it is idle, and keeps the stable project entry intact.
 
-Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
+Version 0.3 can defer normal physical rollover until the next user message: the scanner prepares a verified handoff at the threshold, then an awaited pre-dispatch hook rotates the physical session before that message is sent to the agent. The completed answer therefore remains visible for review. Emergency rollover is still immediate. Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
 
 ## Measured cost model
 
@@ -31,6 +31,7 @@ formulas, caveats, and official pricing sources.
 - User-selected provider/model overrides
 - Thinking preferences and, when explicitly enabled, the user's current Standard/Fast choice
 - An idempotent, operator-visible rollover notice
+- Optional deferred normal rollover that activates before the next inbound task is dispatched
 
 ## Safety model
 
@@ -41,6 +42,8 @@ formulas, caveats, and official pricing sources.
 - The optional Codex binding check opens the configured SQLite database read-only.
 - Deterministic compaction uses bounded one-pass retention instead of copying the full normalized transcript.
 - Emergency recovery backs up first, then calls the official `sessions.compact --max-lines` Gateway RPC. It never rewrites an active transcript or `sessions.json` directly.
+- Deferred activation is awaited and fail closed: if reset verification fails, the inbound task is not executed and can be retried safely.
+- The deferred hook never logs or persists the inbound prompt.
 
 ## Requirements
 
@@ -116,10 +119,19 @@ session value across scans and physical rollover instead of forcing the default
 back onto an explicit user choice. Keep the option disabled for unattended or
 role-agent sessions that must always run in Standard mode.
 
+`rolloverTiming.deferUntilNextUserMessage` is also opt-in. When enabled, the
+scanner arms normal threshold rollovers without changing the current physical
+session. The plugin's awaited `before_dispatch` hook activates the pending
+rollover and then lets the original inbound task continue in the new session.
+Emergency thresholds and retired Codex-binding recovery remain immediate. The
+hook must point to this repository's manager script, production configuration
+and state file through the plugin's `deferredRollover` settings.
+
 Run a real scan only after the dry run is clean:
 
 ```bash
 python3 session_rollover.py scan
+python3 session_rollover.py activate-pending --session-key agent:main:project-example
 python3 session_rollover.py status
 ```
 
@@ -129,6 +141,7 @@ python3 session_rollover.py status
 python3 session_rollover.py scan --dry-run
 python3 session_rollover.py scan
 python3 session_rollover.py rollover --session-key agent:main:project-example --dry-run
+python3 session_rollover.py activate-pending --session-key agent:main:project-example --dry-run
 python3 session_rollover.py repair-visibility --session-key agent:main:project-example --dry-run
 python3 session_rollover.py status
 

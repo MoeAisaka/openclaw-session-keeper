@@ -2,7 +2,7 @@
   "id": "openclaw-session-keeper",
   "name": "OpenClaw Session Keeper",
   "description": "Safe physical rollover and optional deterministic compaction for compatible OpenClaw runtimes.",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -24,6 +24,23 @@
         "minimum": 300,
         "maximum": 5000,
         "default": 1600
+      },
+      "deferredRollover": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "pythonPath": { "type": "string", "minLength": 1 },
+          "managerScriptPath": { "type": "string", "minLength": 1 },
+          "managerConfigPath": { "type": "string", "minLength": 1 },
+          "statePath": { "type": "string", "minLength": 1 },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 60000,
+            "default": 30000
+          }
+        }
       }
     }
   }

@@ -1,6 +1,6 @@
 {
   "name": "openclaw-session-keeper",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Safe long-session compaction and physical rollover for OpenClaw",

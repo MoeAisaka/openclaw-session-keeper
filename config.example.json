@@ -19,6 +19,9 @@
     "historyCheckLimit": 200,
     "repairExistingSessionKeys": []
   },
+  "rolloverTiming": {
+    "deferUntilNextUserMessage": true
+  },
   "thresholds": {
     "checkpointTokens": 190000,
     "rolloverTokens": 235000,
