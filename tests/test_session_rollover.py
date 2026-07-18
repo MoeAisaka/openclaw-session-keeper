@@ -118,6 +118,163 @@ class RolloverTests(unittest.TestCase):
             manager = self.make_manager(Path(value))
             self.assertFalse(manager._is_idle({"status": "running", "updatedAt": 0}))
 
+    def test_rollover_threshold_arms_handoff_without_reset(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["rolloverTiming"] = {"deferUntilNextUserMessage": True}
+            manager.config["thresholds"]["minIdleSeconds"] = 0
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "message", "message": {"role": "assistant", "content": "final answer"}}),
+                encoding="utf-8",
+            )
+            entry = {
+                "sessionId": "old-session",
+                "sessionFile": str(transcript),
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": entry,
+            }), encoding="utf-8")
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            handoff = {"handoffPath": str(handoff_path), "continuityContext": "verified"}
+            with patch.object(manager, "_handoff", return_value=handoff), patch.object(
+                manager, "_gateway_reset"
+            ) as gateway_reset:
+                payload = manager.scan()
+            gateway_reset.assert_not_called()
+            self.assertEqual(payload["results"][0]["action"], "rollover_deferred")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "pending_next_user")
+            self.assertEqual(current["oldSessionId"], "old-session")
+
+            with patch.object(manager, "_handoff") as handoff_again:
+                payload = manager.scan()
+            handoff_again.assert_not_called()
+            self.assertEqual(payload["results"][0]["action"], "rollover_pending_next_user")
+
+    def test_pending_rollover_activates_from_stored_handoff(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            old_entry = {
+                "sessionId": "old-session",
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            sessions_path = root / "sessions.json"
+            sessions_path.write_text(json.dumps({
+                "agent:main:project-test": old_entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "pending_next_user",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "label": "测试",
+                "project": "test",
+                "tokens": 270000,
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+                "continuityContext": "verified",
+            })
+
+            def gateway_reset(_session_key):
+                new_entry = {**old_entry, "sessionId": "new-session", "totalTokens": 0}
+                sessions_path.write_text(json.dumps({
+                    "agent:main:project-test": new_entry,
+                }), encoding="utf-8")
+                return {"ok": True, "key": "agent:main:project-test", "entry": new_entry}
+
+            with patch.object(manager, "_gateway_reset", side_effect=gateway_reset):
+                result = manager.activate_pending("agent:main:project-test")
+            self.assertEqual(result["action"], "pending_rollover_activated")
+            self.assertEqual(result["oldSessionId"], "old-session")
+            self.assertEqual(result["newSessionId"], "new-session")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "active")
+            self.assertEqual(current["activationTrigger"], "next_user_message")
+
+    def test_activate_pending_is_idempotent_when_nothing_is_armed(self):
+        with tempfile.TemporaryDirectory() as value:
+            manager = self.make_manager(Path(value))
+            self.assertEqual(
+                manager.activate_pending("agent:main:project-test")["action"],
+                "no_pending_rollover",
+            )
+
+    def test_prepared_rollover_reconciles_before_retry_dispatch(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            new_entry = {
+                "sessionId": "new-session",
+                "totalTokens": 0,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": new_entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "prepared",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "label": "测试",
+                "project": "test",
+                "tokens": 270000,
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+                "continuityContext": "verified",
+            })
+            result = manager.activate_pending("agent:main:project-test")
+            self.assertEqual(result["action"], "pending_rollover_reconciled")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "active")
+            self.assertEqual(current["newSessionId"], "new-session")
+
+    def test_emergency_threshold_still_rolls_over_immediately(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["rolloverTiming"] = {"deferUntilNextUserMessage": True}
+            manager.config["thresholds"]["minIdleSeconds"] = 0
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": {
+                    "sessionId": "old-session",
+                    "totalTokens": 320000,
+                    "status": "done",
+                    "updatedAt": 0,
+                    "thinkingLevel": "xhigh",
+                    "fastMode": False,
+                }
+            }), encoding="utf-8")
+            with patch.object(
+                manager,
+                "_rollover_unlocked",
+                return_value={"sessionKey": "agent:main:project-test", "action": "immediate"},
+            ) as rollover:
+                payload = manager.scan()
+            rollover.assert_called_once_with("agent:main:project-test", dry_run=False)
+            self.assertEqual(payload["results"][0]["action"], "immediate")
+
     def test_codex_binding_key_matches_openclaw(self):
         self.assertEqual(
             MODULE.codex_binding_store_key("agent:main:project-example"),

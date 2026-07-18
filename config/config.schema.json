@@ -19,6 +19,13 @@
     "nmemBin": {"type": "string", "minLength": 1},
     "sessionPreferences": {"type": "object"},
     "visibleContinuity": {"type": "object"},
+    "rolloverTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deferUntilNextUserMessage": {"type": "boolean", "default": false}
+      }
+    },
     "thresholds": {
       "type": "object",
       "required": ["checkpointTokens", "rolloverTokens", "emergencyTokens", "maxPhysicalAgeDays", "minIdleSeconds"],

@@ -4,7 +4,7 @@
 
 它会在会话空闲时生成带校验的交接包，再通过 Gateway 官方接口重置物理 `sessionId`，同时保留稳定 `sessionKey`、项目标签、用户手动模型选择、思考等级，以及显式启用后的当前 Standard/Fast 选择。
 
-V0.2 新增了面向兼容内嵌 Runtime 的确定性压缩 Provider，并将超大会话恢复纳入 OpenClaw Gateway 生命周期锁。原生托管 Codex 会话由 OpenClaw `2026.7.1` 自行接管压缩，必须按下述兼容策略配置。
+V0.3 支持把普通阈值换代延后到下一条用户消息：巡检器只生成并校验交接包，等待型 `before_dispatch` 钩子会在该消息交给 Agent 之前完成物理换代，再让原任务在新会话继续执行。这样刚完成的最终答复会一直留在当前会话，方便用户阅读；应急阈值仍立即换代。V0.2 新增了面向兼容内嵌 Runtime 的确定性压缩 Provider，并将超大会话恢复纳入 OpenClaw Gateway 生命周期锁。原生托管 Codex 会话由 OpenClaw `2026.7.1` 自行接管压缩，必须按下述兼容策略配置。
 
 ## Token 与费用对比
 
@@ -28,6 +28,8 @@ python3 cost_estimator.py --json
 - 真实配置、转录、日志、数据库、备份和密钥文件均被 Git 忽略与秘密扫描器拦截。
 - 确定性摘要采用有界单遍处理，不会为整段超大转录再复制一份标准化消息数组。
 - 应急恢复先完成私有备份和哈希校验，再调用官方 `sessions.compact --max-lines`；不会直接改写活动转录或 `sessions.json`。
+- 延迟换代钩子采用等待式、失败关闭语义；换代校验失败时，本条任务不会进入 Agent，也不会产生重复执行。
+- 钩子不记录、不持久化用户本次输入内容。
 
 ## 托管 Codex OAuth 兼容策略
 
@@ -89,6 +91,18 @@ python3 session_rollover.py scan --dry-run
 先用自己的稳定会话替换示例项，确认 dry-run 正常后再执行真实扫描。
 
 `allowManualFastMode` 需要按会话显式开启。配置中的 `fastMode` 仍是默认值；开启后，Keeper 会在巡检和物理换代时保留用户当前选择的布尔值，而不会再次把显式 Fast 选择强制改回默认 Standard。无人值守任务和必须固定 Standard 的角色 Agent 不应开启此选项。
+
+`rolloverTiming.deferUntilNextUserMessage` 也需要显式开启。开启后，普通阈值只会进入 `pending_next_user` 状态；下一条用户消息到达时，插件的等待型 `before_dispatch` 钩子先激活换代，再让原消息在新物理会话中继续。应急阈值与已退役 Codex 绑定恢复仍立即执行。插件的 `deferredRollover` 配置必须指向本仓库管理器脚本、生产配置与状态文件。
+
+常用命令：
+
+```bash
+python3 session_rollover.py scan --dry-run
+python3 session_rollover.py scan
+python3 session_rollover.py activate-pending --session-key agent:main:project-example --dry-run
+python3 session_rollover.py activate-pending --session-key agent:main:project-example
+python3 session_rollover.py status
+```
 
 应急恢复默认只预览：
 

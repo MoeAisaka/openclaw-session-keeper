@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
-import plugin, { COMPACTION_PROVIDER_ID } from "../src/index.js";
+import plugin, {
+  COMPACTION_PROVIDER_ID,
+  createDeferredRolloverHook,
+  readPendingRollover,
+  resolveDeferredRolloverOptions,
+} from "../src/index.js";
 import {
   buildDeterministicSummary,
   redactSecrets,
@@ -139,4 +147,100 @@ test("option coercion stays within safe bounds", () => {
     maxItemsPerSection: 40,
     maxItemChars: 1600,
   });
+});
+
+test("deferred rollover options are disabled by default and bounded", () => {
+  const options = resolveDeferredRolloverOptions({
+    deferredRollover: { enabled: true, timeoutMs: 999999 },
+  });
+  assert.equal(options.enabled, true);
+  assert.equal(options.timeoutMs, 60000);
+  assert.match(options.managerScriptPath, /session_rollover\.py$/);
+});
+
+test("reads only a pending or partially committed generation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-keeper-"));
+  const statePath = path.join(root, "current.json");
+  fs.writeFileSync(statePath, JSON.stringify({
+    sessions: {
+      "agent:main:project-example": {
+        status: "pending_next_user",
+        oldSessionId: "old-session",
+      },
+      "agent:main:test-active": {
+        status: "active",
+        oldSessionId: "old-session",
+      },
+      "agent:main:project-test": {
+        status: "prepared",
+        oldSessionId: "old-session",
+      },
+    },
+  }));
+  assert.equal(
+    readPendingRollover(statePath, "agent:main:project-example").oldSessionId,
+    "old-session",
+  );
+  assert.equal(readPendingRollover(statePath, "agent:main:test-active"), null);
+  assert.equal(
+    readPendingRollover(statePath, "agent:main:project-test").oldSessionId,
+    "old-session",
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("before_dispatch activates pending rollover and lets the original task continue", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-keeper-"));
+  const statePath = path.join(root, "current.json");
+  fs.writeFileSync(statePath, JSON.stringify({
+    sessions: {
+      "agent:main:project-example": {
+        status: "pending_next_user",
+        oldSessionId: "old-session",
+      },
+    },
+  }));
+  const calls = [];
+  const hook = createDeferredRolloverHook(
+    { statePath },
+    { info() {}, error() {} },
+    async (_options, sessionKey) => {
+      calls.push(sessionKey);
+      return { action: "pending_rollover_activated" };
+    },
+  );
+  const result = await hook(
+    { sessionKey: "agent:main:project-example" },
+    {},
+  );
+  assert.deepEqual(calls, ["agent:main:project-example"]);
+  assert.deepEqual(result, { handled: false });
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("before_dispatch fails closed without logging or echoing the user prompt", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-keeper-"));
+  const statePath = path.join(root, "current.json");
+  fs.writeFileSync(statePath, JSON.stringify({
+    sessions: {
+      "agent:main:project-example": {
+        status: "pending_next_user",
+        oldSessionId: "old-session",
+      },
+    },
+  }));
+  const errors = [];
+  const hook = createDeferredRolloverHook(
+    { statePath },
+    { info() {}, error(message) { errors.push(message); } },
+    async () => { throw new Error("gateway unavailable"); },
+  );
+  const result = await hook(
+    { sessionKey: "agent:main:project-example", content: "private user task" },
+    {},
+  );
+  assert.equal(result.handled, true);
+  assert.match(result.text, /本条任务未执行/);
+  assert.ok(!errors.join("\n").includes("private user task"));
+  fs.rmSync(root, { recursive: true, force: true });
 });

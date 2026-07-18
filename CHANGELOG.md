@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-18
+
+### Added
+
+- Add an opt-in deferred rollover state machine: the periodic scanner prepares a checksummed handoff at the normal threshold, while the awaited `before_dispatch` hook activates the rollover before the next user task is dispatched.
+- Add the idempotent `activate-pending` operator command and deterministic coverage for arming, activation, retry and emergency paths.
+
+### Changed
+
+- Preserve the just-finished assistant answer in the current physical session until the next user message arrives.
+- Keep emergency thresholds and retired Codex-binding recovery immediate and fail closed.
+
+### Security
+
+- Never log or persist the inbound prompt in the deferred rollover hook.
+- Fail closed before agent execution when a pending rollover cannot be verified or activated, so retrying cannot duplicate a partially executed task.
+
 ## [0.2.2] - 2026-07-16
 
 ### Fixed

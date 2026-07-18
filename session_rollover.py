@@ -30,7 +30,7 @@ DEFAULT_CONFIG = Path(
         Path.home() / ".config" / "openclaw-session-keeper" / "config.json",
     )
 ).expanduser()
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 ACTIVE_TASK_STATUSES = {"planned", "in_progress", "waiting", "blocked"}
 IDLE_STATUSES = {None, "", "done", "idle", "killed", "failed", "timed_out", "cancelled"}
 PATH_RE = re.compile(
@@ -43,6 +43,9 @@ DEFAULT_VISIBLE_CONTINUITY = {
     "label": "会话换代",
     "historyCheckLimit": 200,
     "repairExistingSessionKeys": [],
+}
+DEFAULT_ROLLOVER_TIMING = {
+    "deferUntilNextUserMessage": False,
 }
 
 
@@ -565,6 +568,15 @@ class RolloverManager:
             raise RuntimeError("visible_continuity_repair_keys_invalid")
         return merged
 
+    def _rollover_timing_config(self) -> dict[str, Any]:
+        value = self.config.get("rolloverTiming", {})
+        if not isinstance(value, dict):
+            raise RuntimeError("rollover_timing_config_invalid")
+        merged = {**DEFAULT_ROLLOVER_TIMING, **value}
+        if not isinstance(merged.get("deferUntilNextUserMessage"), bool):
+            raise RuntimeError("rollover_timing_defer_invalid")
+        return merged
+
     def _history_contains_notice(self, session_key: str, marker: str, limit: int) -> bool:
         payload = self._gateway_call(
             "chat.history",
@@ -796,6 +808,209 @@ class RolloverManager:
             },
         }
 
+    def _arm_rollover_unlocked(
+        self,
+        session_key: str,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare a verified handoff but leave the current generation visible."""
+        spec = self.config.get("sessions", {}).get(session_key)
+        if not isinstance(spec, dict):
+            raise RuntimeError("session_not_allowlisted")
+        entry = self._sessions().get(session_key)
+        if not isinstance(entry, dict):
+            raise RuntimeError("session_entry_missing")
+        tokens = int(entry.get("totalTokens") or 0)
+        decision = self._decision(tokens, entry, spec)
+        if decision["action"] != "rollover":
+            return {
+                "sessionKey": session_key,
+                "action": "skip_not_deferred_rollover",
+                "tokens": tokens,
+                **{key: value for key, value in decision.items() if key != "action"},
+            }
+        if not self._is_idle(entry):
+            return {
+                "sessionKey": session_key,
+                "action": "pending_busy",
+                "tokens": tokens,
+                "status": entry.get("status"),
+                **{key: value for key, value in decision.items() if key != "action"},
+            }
+        current = read_json(self.current_path, {"sessions": {}})
+        existing = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") == "pending_next_user"
+            and existing.get("oldSessionId") == entry.get("sessionId")
+            and Path(str(existing.get("handoffPath") or "")).is_file()
+        ):
+            return {
+                "sessionKey": session_key,
+                "action": "rollover_pending_next_user",
+                "tokens": tokens,
+                "sessionId": entry.get("sessionId"),
+                "armedAt": existing.get("armedAt"),
+                **{key: value for key, value in decision.items() if key != "action"},
+            }
+        if dry_run:
+            return {
+                "sessionKey": session_key,
+                "action": "would_defer_rollover",
+                "tokens": tokens,
+                "sessionId": entry.get("sessionId"),
+                "trigger": decision["reason"],
+                **{key: value for key, value in decision.items() if key != "action"},
+            }
+        entry, preferences_repaired = self._ensure_preferences(session_key, spec, entry)
+        handoff = self._handoff(session_key, spec, entry)
+        record = {
+            "status": "pending_next_user",
+            "sessionKey": session_key,
+            "oldSessionId": entry.get("sessionId"),
+            "label": spec["label"],
+            "project": spec["project"],
+            "tokens": tokens,
+            "trigger": decision["reason"],
+            "transcriptBytes": decision["transcriptBytes"],
+            "physicalAgeDays": decision["physicalAgeDays"],
+            "handoffPath": handoff["handoffPath"],
+            "continuityContext": handoff["continuityContext"],
+            "handoffSha256": sha256_file(Path(handoff["handoffPath"])),
+            "sessionPreferences": self._desired_preferences(spec, entry),
+            "manualModelSelection": self._manual_model_selection(entry),
+            "preferencesRepairedBeforeArm": preferences_repaired,
+            "maxInjections": 3,
+            "armedAt": now_iso(),
+        }
+        self._update_current(session_key, record)
+        event = {
+            "ts": now_iso(),
+            "event": "rollover_deferred",
+            "sessionKey": session_key,
+            "oldSessionId": entry.get("sessionId"),
+            "tokens": tokens,
+            "trigger": decision["reason"],
+            "handoffPath": handoff["handoffPath"],
+        }
+        append_jsonl(self.events_path, event)
+        return {**event, "action": "rollover_deferred"}
+
+    def _activate_pending_unlocked(
+        self,
+        session_key: str,
+        *,
+        dry_run: bool = False,
+        trigger_override: str = "next_user_message",
+    ) -> dict[str, Any]:
+        """Rotate a previously armed generation immediately before dispatch."""
+        spec = self.config.get("sessions", {}).get(session_key)
+        if not isinstance(spec, dict):
+            raise RuntimeError("session_not_allowlisted")
+        current = read_json(self.current_path, {"sessions": {}})
+        record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
+        if not isinstance(record, dict) or record.get("status") not in {"pending_next_user", "prepared"}:
+            return {"sessionKey": session_key, "action": "no_pending_rollover"}
+        entry = self._sessions().get(session_key)
+        if not isinstance(entry, dict):
+            raise RuntimeError("session_entry_missing")
+        old_session_id = str(record.get("oldSessionId") or "")
+        if not old_session_id or str(entry.get("sessionId") or "") != old_session_id:
+            raise RuntimeError("pending_rollover_generation_mismatch")
+        handoff_path = Path(str(record.get("handoffPath") or ""))
+        if not handoff_path.is_file():
+            raise RuntimeError("pending_rollover_handoff_missing")
+        expected_sha = str(record.get("handoffSha256") or "")
+        if not expected_sha or sha256_file(handoff_path) != expected_sha:
+            raise RuntimeError("pending_rollover_handoff_hash_mismatch")
+        if dry_run:
+            return {
+                "sessionKey": session_key,
+                "action": "would_activate_pending_rollover",
+                "oldSessionId": old_session_id,
+                "handoffPath": str(handoff_path),
+            }
+        entry, preferences_repaired_before_reset = self._ensure_preferences(session_key, spec, entry)
+        desired_preferences = self._desired_preferences(spec, entry)
+        manual_selection = self._manual_model_selection(entry)
+        prepared = {
+            **record,
+            "status": "prepared",
+            "sessionPreferences": desired_preferences,
+            "manualModelSelection": manual_selection,
+            "preferencesRepairedBeforeReset": preferences_repaired_before_reset,
+            "activationTrigger": trigger_override,
+            "activationStartedAt": now_iso(),
+        }
+        self._update_current(session_key, prepared)
+        response = self._gateway_reset(session_key)
+        refreshed = self._sessions().get(session_key, {})
+        response_entry = response.get("entry") if isinstance(response.get("entry"), dict) else {}
+        new_session_id = refreshed.get("sessionId") or response_entry.get("sessionId")
+        if not new_session_id or str(new_session_id) == old_session_id:
+            raise RuntimeError("gateway_reset_did_not_rotate_session_id")
+        if refreshed.get("label", response_entry.get("label")) != entry.get("label"):
+            raise RuntimeError("stable_label_not_preserved")
+        refreshed, preferences_repaired_after_reset = self._ensure_preferences(
+            session_key,
+            spec,
+            refreshed,
+            desired=desired_preferences,
+        )
+        if self._manual_model_selection(refreshed) != manual_selection:
+            raise RuntimeError("manual_model_selection_not_preserved")
+        try:
+            visibility_notice = self._ensure_visible_continuity(
+                session_key,
+                prepared,
+                str(new_session_id),
+            )
+            if visibility_notice.get("status") == "pending_busy":
+                raise RuntimeError("visibility_notice_pending_busy")
+        except Exception as exc:
+            self._update_current(session_key, {
+                **prepared,
+                "newSessionId": str(new_session_id),
+                "visibilityNotice": {
+                    "status": "pending_retry",
+                    "lastError": str(exc),
+                    "lastAttemptAt": now_iso(),
+                },
+            })
+            raise RuntimeError(f"visibility_notice_failed:{exc}") from exc
+        active = self._activation_value(
+            prepared={
+                **prepared,
+                "preferencesRepairedAfterReset": preferences_repaired_after_reset,
+            },
+            new_session_id=str(new_session_id),
+            response=response,
+            visibility_notice=visibility_notice,
+        )
+        self._update_current(session_key, active)
+        event = {
+            "ts": now_iso(),
+            "event": "rollover_completed",
+            "action": "pending_rollover_activated",
+            "sessionKey": session_key,
+            "label": spec["label"],
+            "oldSessionId": old_session_id,
+            "newSessionId": new_session_id,
+            "tokensBefore": int(record.get("tokens") or entry.get("totalTokens") or 0),
+            "transcriptBytesBefore": int(record.get("transcriptBytes") or 0),
+            "trigger": trigger_override,
+            "thinkingLevel": refreshed.get("thinkingLevel"),
+            "fastMode": refreshed.get("fastMode"),
+            "providerOverride": refreshed.get("providerOverride"),
+            "modelOverride": refreshed.get("modelOverride"),
+            "modelOverrideSource": refreshed.get("modelOverrideSource"),
+            "handoffPath": str(handoff_path),
+            "visibilityNotice": visibility_notice,
+        }
+        append_jsonl(self.events_path, event)
+        return event
+
     def _reconcile_prepared(self, sessions: dict[str, Any]) -> list[dict[str, Any]]:
         """Recover a reset that committed before the manager could mark it active."""
         current = read_json(self.current_path, {"schemaVersion": 1, "sessions": {}})
@@ -1015,6 +1230,37 @@ class RolloverManager:
                 trigger_override=trigger_override,
             )
 
+    def activate_pending(self, session_key: str, *, dry_run: bool = False) -> dict[str, Any]:
+        if dry_run:
+            return self._activate_pending_unlocked(session_key, dry_run=True)
+        with self._lock() as acquired:
+            if not acquired:
+                return {"sessionKey": session_key, "action": "lock_busy"}
+            current = read_json(self.current_path, {"sessions": {}})
+            record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
+            if isinstance(record, dict) and record.get("status") == "prepared":
+                sessions = self._sessions()
+                entry = sessions.get(session_key, {})
+                old_session_id = str(record.get("oldSessionId") or "")
+                current_session_id = str(entry.get("sessionId") or "") if isinstance(entry, dict) else ""
+                if current_session_id and current_session_id != old_session_id:
+                    self._reconcile_prepared(sessions)
+                    refreshed = read_json(self.current_path, {"sessions": {}})
+                    refreshed_record = (
+                        refreshed.get("sessions", {}).get(session_key, {})
+                        if isinstance(refreshed, dict)
+                        else {}
+                    )
+                    if isinstance(refreshed_record, dict) and refreshed_record.get("status") == "active":
+                        return {
+                            "sessionKey": session_key,
+                            "action": "pending_rollover_reconciled",
+                            "oldSessionId": old_session_id,
+                            "newSessionId": current_session_id,
+                        }
+                    raise RuntimeError("pending_rollover_reconcile_failed")
+            return self._activate_pending_unlocked(session_key)
+
     def repair_visibility(
         self,
         session_key: str,
@@ -1212,9 +1458,46 @@ class RolloverManager:
                 tokens = int(entry.get("totalTokens") or 0)
                 decision = self._decision(tokens, entry, spec)
                 action = decision["action"]
-                if action in {"rollover", "emergency"}:
+                current = read_json(self.current_path, {"sessions": {}})
+                current_record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
+                pending_current_generation = (
+                    isinstance(current_record, dict)
+                    and current_record.get("status") == "pending_next_user"
+                    and current_record.get("oldSessionId") == entry.get("sessionId")
+                )
+                if (
+                    isinstance(current_record, dict)
+                    and current_record.get("status") == "pending_next_user"
+                    and not pending_current_generation
+                    and not dry_run
+                ):
+                    self._update_current(session_key, {
+                        **current_record,
+                        "status": "superseded",
+                        "supersededAt": now_iso(),
+                        "observedSessionId": entry.get("sessionId"),
+                    })
+                if action == "emergency":
                     try:
-                        results.append(self._rollover_unlocked(session_key, dry_run=dry_run))
+                        if pending_current_generation:
+                            results.append(self._activate_pending_unlocked(
+                                session_key,
+                                dry_run=dry_run,
+                                trigger_override=decision["reason"],
+                            ))
+                        else:
+                            results.append(self._rollover_unlocked(session_key, dry_run=dry_run))
+                    except Exception as exc:
+                        error = {"sessionKey": session_key, "action": "error", "error": str(exc), "tokens": tokens}
+                        results.append(error)
+                        if not dry_run:
+                            append_jsonl(self.events_path, {"ts": now_iso(), "event": "rollover_failed", **error})
+                elif action == "rollover":
+                    try:
+                        if self._rollover_timing_config()["deferUntilNextUserMessage"]:
+                            results.append(self._arm_rollover_unlocked(session_key, dry_run=dry_run))
+                        else:
+                            results.append(self._rollover_unlocked(session_key, dry_run=dry_run))
                     except Exception as exc:
                         error = {"sessionKey": session_key, "action": "error", "error": str(exc), "tokens": tokens}
                         results.append(error)
@@ -1292,6 +1575,9 @@ def main() -> int:
     rollover.add_argument("--session-key", required=True)
     rollover.add_argument("--force", action="store_true")
     rollover.add_argument("--dry-run", action="store_true")
+    activate = sub.add_parser("activate-pending")
+    activate.add_argument("--session-key", required=True)
+    activate.add_argument("--dry-run", action="store_true")
     visibility = sub.add_parser("repair-visibility")
     visibility.add_argument("--session-key", required=True)
     visibility.add_argument("--force", action="store_true")
@@ -1304,6 +1590,8 @@ def main() -> int:
             payload = manager.scan(dry_run=args.dry_run)
         elif args.command == "rollover":
             payload = manager.rollover(args.session_key, force=args.force, dry_run=args.dry_run)
+        elif args.command == "activate-pending":
+            payload = manager.activate_pending(args.session_key, dry_run=args.dry_run)
         elif args.command == "repair-visibility":
             payload = manager.repair_visibility(
                 args.session_key,
