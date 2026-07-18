@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-16
+
+### Fixed
+
+- Preserve an explicitly enabled user's current Standard/Fast choice during periodic preference repair and physical session rollover.
+- Restore the pre-reset speed choice after `sessions.reset` instead of reapplying the configured default.
+
+### Security
+
+- Keep manual speed preservation opt-in per session so unattended and role-agent sessions can remain pinned to Standard mode.
+
 ## [0.2.1] - 2026-07-15
 
 ### Fixed

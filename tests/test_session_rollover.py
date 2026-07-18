@@ -713,7 +713,7 @@ class RolloverTests(unittest.TestCase):
                 "fastMode": False,
             })
 
-    def test_manual_model_override_suspends_thinking_repair_but_keeps_fast_disabled(self):
+    def test_manual_model_override_suspends_thinking_repair_and_preserves_user_fast_mode(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             manager = self.make_manager(root)
@@ -722,6 +722,7 @@ class RolloverTests(unittest.TestCase):
                 "project": "manual",
                 "query": "manual",
                 "allowManualModelOverride": True,
+                "allowManualFastMode": True,
                 "preferences": {"thinkingLevel": "xhigh", "fastMode": False},
             }
             entry = {
@@ -730,9 +731,9 @@ class RolloverTests(unittest.TestCase):
                 "modelOverride": "deepseek-v4-pro",
                 "modelOverrideSource": "user",
                 "thinkingLevel": "high",
-                "fastMode": False,
+                "fastMode": True,
             }
-            self.assertEqual(manager._desired_preferences(spec, entry), {"fastMode": False})
+            self.assertEqual(manager._desired_preferences(spec, entry), {"fastMode": True})
             with patch.object(manager, "_gateway_call") as gateway_call:
                 repaired_entry, repaired = manager._ensure_preferences(
                     "agent:main:project-test", spec, entry
@@ -740,12 +741,62 @@ class RolloverTests(unittest.TestCase):
             gateway_call.assert_not_called()
             self.assertFalse(repaired)
             self.assertEqual(repaired_entry["thinkingLevel"], "high")
+            self.assertTrue(repaired_entry["fastMode"])
+
+    def test_manual_fast_mode_defaults_to_standard_until_user_enables_it(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            spec = {
+                "label": "Manual speed project",
+                "project": "manual",
+                "query": "manual",
+                "allowManualFastMode": True,
+                "preferences": {"thinkingLevel": "xhigh", "fastMode": False},
+            }
+            self.assertEqual(manager._desired_preferences(spec, {}), {
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            })
+            self.assertEqual(manager._desired_preferences(spec, {"fastMode": True}), {
+                "thinkingLevel": "xhigh",
+                "fastMode": True,
+            })
+
+    def test_pre_reset_manual_fast_mode_can_be_restored_after_reset(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            spec = {
+                "label": "Manual speed project",
+                "project": "manual",
+                "query": "manual",
+                "allowManualFastMode": True,
+                "preferences": {"thinkingLevel": "xhigh", "fastMode": False},
+            }
+            reset_entry = {"sessionId": "new-session", "thinkingLevel": "xhigh", "fastMode": False}
+
+            def gateway_call(method, params):
+                self.assertEqual(method, "sessions.patch")
+                self.assertEqual(params["fastMode"], True)
+                return {"ok": True, "entry": {**reset_entry, **params}}
+
+            with patch.object(manager, "_gateway_call", side_effect=gateway_call):
+                repaired_entry, repaired = manager._ensure_preferences(
+                    "agent:main:project-test",
+                    spec,
+                    reset_entry,
+                    desired={"fastMode": True},
+                )
+            self.assertTrue(repaired)
+            self.assertTrue(repaired_entry["fastMode"])
 
     def test_rollover_preserves_user_model_selection(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             manager = self.make_manager(root)
             manager.config["sessions"]["agent:main:project-test"]["allowManualModelOverride"] = True
+            manager.config["sessions"]["agent:main:project-test"]["allowManualFastMode"] = True
             transcript = root / "session.jsonl"
             transcript.write_text(
                 json.dumps({"type": "message", "message": {"role": "user", "content": "继续处理"}}, ensure_ascii=False),
@@ -762,7 +813,7 @@ class RolloverTests(unittest.TestCase):
                 "modelOverride": "deepseek-v4-pro",
                 "modelOverrideSource": "user",
                 "thinkingLevel": "high",
-                "fastMode": False,
+                "fastMode": True,
             }
             (root / "sessions.json").write_text(json.dumps({
                 "agent:main:project-test": old_entry
@@ -793,7 +844,7 @@ class RolloverTests(unittest.TestCase):
                 "providerOverride": "deepseek",
                 "modelOverride": "deepseek-v4-pro",
             })
-            self.assertEqual(record["sessionPreferences"], {"fastMode": False})
+            self.assertEqual(record["sessionPreferences"], {"fastMode": True})
 
     def test_model_driven_thinking_can_clear_session_override(self):
         with tempfile.TemporaryDirectory() as value:

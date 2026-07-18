@@ -30,7 +30,7 @@ DEFAULT_CONFIG = Path(
         Path.home() / ".config" / "openclaw-session-keeper" / "config.json",
     )
 ).expanduser()
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 ACTIVE_TASK_STATUSES = {"planned", "in_progress", "waiting", "blocked"}
 IDLE_STATUSES = {None, "", "done", "idle", "killed", "failed", "timed_out", "cancelled"}
 PATH_RE = re.compile(
@@ -448,6 +448,10 @@ class RolloverManager:
             preferences.pop("thinkingLevel", None)
         thinking_level = preferences.get("thinkingLevel")
         fast_mode = preferences.get("fastMode")
+        if spec.get("allowManualFastMode") is True and isinstance(entry, dict):
+            observed_fast_mode = entry.get("fastMode")
+            if isinstance(observed_fast_mode, bool):
+                fast_mode = observed_fast_mode
         if thinking_level is not None and thinking_level not in VALID_THINKING_LEVELS:
             raise RuntimeError(f"invalid_thinking_level:{thinking_level}")
         if fast_mode not in VALID_FAST_MODES:
@@ -657,18 +661,19 @@ class RolloverManager:
         session_key: str,
         spec: dict[str, Any],
         entry: dict[str, Any] | None = None,
+        desired: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         current = entry if isinstance(entry, dict) else self._sessions().get(session_key, {})
         if not isinstance(current, dict):
             raise RuntimeError("session_entry_missing")
-        desired = self._desired_preferences(spec, current)
+        expected = dict(desired) if isinstance(desired, dict) else self._desired_preferences(spec, current)
         repaired = False
-        if not self._preferences_match(current, desired):
-            payload = self._gateway_call("sessions.patch", {"key": session_key, **desired})
+        if not self._preferences_match(current, expected):
+            payload = self._gateway_call("sessions.patch", {"key": session_key, **expected})
             patched = payload.get("entry")
             current = patched if isinstance(patched, dict) else self._sessions().get(session_key, {})
             repaired = True
-        if not isinstance(current, dict) or not self._preferences_match(current, desired):
+        if not isinstance(current, dict) or not self._preferences_match(current, expected):
             raise RuntimeError("session_preferences_verification_failed")
         return current, repaired
 
@@ -902,6 +907,7 @@ class RolloverManager:
                 **{key: value for key, value in decision.items() if key != "action"},
             }
         entry, preferences_repaired_before_reset = self._ensure_preferences(session_key, spec, entry)
+        desired_preferences_before_reset = self._desired_preferences(spec, entry)
         manual_selection_before_reset = self._manual_model_selection(entry)
         handoff = self._handoff(session_key, spec, entry)
         old_session_id = entry["sessionId"]
@@ -914,7 +920,7 @@ class RolloverManager:
             "handoffPath": handoff["handoffPath"],
             "continuityContext": handoff["continuityContext"],
             "handoffSha256": sha256_file(Path(handoff["handoffPath"])),
-            "sessionPreferences": self._desired_preferences(spec, entry),
+            "sessionPreferences": desired_preferences_before_reset,
             "manualModelSelection": manual_selection_before_reset,
             "preferencesRepairedBeforeReset": preferences_repaired_before_reset,
             "maxInjections": 3,
@@ -930,7 +936,12 @@ class RolloverManager:
         observed_label = refreshed.get("label", response_entry.get("label"))
         if observed_label != entry.get("label"):
             raise RuntimeError("stable_label_not_preserved")
-        refreshed, preferences_repaired_after_reset = self._ensure_preferences(session_key, spec, refreshed)
+        refreshed, preferences_repaired_after_reset = self._ensure_preferences(
+            session_key,
+            spec,
+            refreshed,
+            desired=desired_preferences_before_reset,
+        )
         manual_selection_after_reset = self._manual_model_selection(refreshed)
         if manual_selection_after_reset != manual_selection_before_reset:
             raise RuntimeError("manual_model_selection_not_preserved")
