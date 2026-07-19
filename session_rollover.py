@@ -71,6 +71,12 @@ def iso_age_seconds(value: Any) -> float | None:
         return None
 
 
+def is_active_reset_rejection(error: Exception) -> bool:
+    """Recognize the reviewed Gateway reject-if-active response without persisting it."""
+    text = str(error).lower()
+    return "still active" in text or "active; try again" in text
+
+
 def atomic_write_json(path: Path, value: Any) -> None:
     ensure_private_dir(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -281,7 +287,7 @@ def render_visible_continuity_notice(
     if outcome:
         lines.extend(["上一轮最终答复（原文节选）：", "", outcome, ""])
     lines.extend([
-        "说明：换代校验成功不等于新会话任务已执行；首个新会话任务会单独记录开始与结束状态。",
+        "说明：物理重置只会在旧会话运行释放后执行；换代成功不代表新会话已有任务执行。",
         marker,
     ])
     return "\n".join(lines)
@@ -954,6 +960,7 @@ class RolloverManager:
         verification: str = "verified",
         visibility_notice: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        reset_mode = str(prepared.get("resetMode") or "unknown_legacy")
         return {
             **prepared,
             "status": "active",
@@ -963,7 +970,8 @@ class RolloverManager:
             "verification": verification,
             "visibilityNotice": visibility_notice or {"status": "disabled"},
             "resetSafety": {
-                "mode": "reject_if_active",
+                "mode": reset_mode,
+                "verified": reset_mode == "reject_if_active",
                 "verifiedAt": now_iso(),
             },
             "gatewayResponse": {
@@ -1117,11 +1125,34 @@ class RolloverManager:
             "sessionPreferences": desired_preferences,
             "manualModelSelection": manual_selection,
             "preferencesRepairedBeforeReset": preferences_repaired_before_reset,
+            "resetMode": "reject_if_active",
             "activationTrigger": trigger_override,
             "activationStartedAt": now_iso(),
         }
         self._update_current(session_key, prepared)
-        response = self._gateway_reset(session_key)
+        try:
+            response = self._gateway_reset(session_key)
+        except Exception as exc:
+            if not is_active_reset_rejection(exc):
+                raise
+            restored = {
+                **record,
+                "status": "pending_next_user",
+                "lastResetAttempt": {
+                    "status": "rejected_active",
+                    "attemptedAt": now_iso(),
+                },
+            }
+            self._update_current(session_key, restored)
+            event = {
+                "ts": now_iso(),
+                "event": "rollover_reset_rejected_active",
+                "action": "reset_rejected_active",
+                "sessionKey": session_key,
+                "oldSessionId": old_session_id,
+            }
+            append_jsonl(self.events_path, event)
+            return event
         refreshed = self._sessions().get(session_key, {})
         response_entry = response.get("entry") if isinstance(response.get("entry"), dict) else {}
         new_session_id = refreshed.get("sessionId") or response_entry.get("sessionId")
@@ -1146,7 +1177,7 @@ class RolloverManager:
             if visibility_notice.get("status") == "pending_busy":
                 visibility_notice = {
                     **visibility_notice,
-                    "status": "deferred_until_first_dispatch_complete",
+                    "status": "pending_retry",
                     "deferredAt": now_iso(),
                 }
         except Exception as exc:
@@ -1214,7 +1245,7 @@ class RolloverManager:
                 if visibility_notice.get("status") == "pending_busy":
                     visibility_notice = {
                         **visibility_notice,
-                        "status": "deferred_until_first_dispatch_complete",
+                        "status": "pending_retry",
                         "deferredAt": now_iso(),
                     }
             except Exception as exc:
@@ -1404,6 +1435,12 @@ class RolloverManager:
                 "trigger": trigger_override or decision["reason"],
                 **{key: value for key, value in decision.items() if key != "action"},
             }
+        current = read_json(self.current_path, {"sessions": {}})
+        previous_record = (
+            current.get("sessions", {}).get(session_key, {})
+            if isinstance(current, dict)
+            else {}
+        )
         entry, preferences_repaired_before_reset = self._ensure_preferences(session_key, spec, entry)
         desired_preferences_before_reset = self._desired_preferences(spec, entry)
         manual_selection_before_reset = self._manual_model_selection(entry)
@@ -1421,11 +1458,45 @@ class RolloverManager:
             "sessionPreferences": desired_preferences_before_reset,
             "manualModelSelection": manual_selection_before_reset,
             "preferencesRepairedBeforeReset": preferences_repaired_before_reset,
+            "resetMode": "reject_if_active",
             "maxInjections": 3,
             "preparedAt": now_iso(),
         }
         self._update_current(session_key, prepared)
-        response = self._gateway_reset(session_key)
+        try:
+            response = self._gateway_reset(session_key)
+        except Exception as exc:
+            if not is_active_reset_rejection(exc):
+                raise
+            if isinstance(previous_record, dict) and previous_record.get("oldSessionId") == old_session_id:
+                restored = {
+                    **previous_record,
+                    "lastResetAttempt": {
+                        "status": "rejected_active",
+                        "attemptedAt": now_iso(),
+                    },
+                }
+            else:
+                restored = {
+                    **prepared,
+                    "status": "ready_after_run",
+                    "drainRun": {
+                        "status": "reset_race_rejected",
+                        "finishedAt": now_iso(),
+                    },
+                    "readyAt": now_iso(),
+                }
+            self._update_current(session_key, restored)
+            event = {
+                "ts": now_iso(),
+                "event": "rollover_reset_rejected_active",
+                "action": "reset_rejected_active",
+                "sessionKey": session_key,
+                "oldSessionId": old_session_id,
+                "trigger": trigger_override or decision["reason"],
+            }
+            append_jsonl(self.events_path, event)
+            return event
         refreshed = self._sessions().get(session_key, {})
         response_entry = response.get("entry") if isinstance(response.get("entry"), dict) else {}
         new_session_id = refreshed.get("sessionId") or response_entry.get("sessionId")
@@ -1652,7 +1723,7 @@ class RolloverManager:
         return results
 
     def _repair_deferred_visibility_notices(self, *, dry_run: bool) -> list[dict[str, Any]]:
-        """Surface the old outcome only when the first new-generation run did not succeed."""
+        """Retry current notices and retain V0.3.2 first-dispatch recovery compatibility."""
         config = self._visible_continuity_config()
         if not config["enabled"]:
             return []
@@ -1664,7 +1735,46 @@ class RolloverManager:
                 continue
             visibility = record.get("visibilityNotice")
             first = record.get("firstDispatch")
-            if not isinstance(visibility, dict) or not isinstance(first, dict):
+            if not isinstance(visibility, dict):
+                continue
+            if not isinstance(first, dict):
+                if visibility.get("status") != "pending_retry":
+                    continue
+                new_session_id = str(record.get("newSessionId") or "")
+                if not new_session_id:
+                    continue
+                try:
+                    result = self._ensure_visible_continuity(
+                        session_key,
+                        record,
+                        new_session_id,
+                        dry_run=dry_run,
+                    )
+                    results.append({"sessionKey": session_key, **result})
+                    if not dry_run and result.get("status") == "verified":
+                        self._update_current(session_key, {
+                            **record,
+                            "visibilityNotice": result,
+                        })
+                        append_jsonl(self.events_path, {
+                            "ts": now_iso(),
+                            "event": "visibility_notice_retry_verified",
+                            "sessionKey": session_key,
+                            "newSessionId": new_session_id,
+                        })
+                except Exception as exc:
+                    error = {
+                        "sessionKey": session_key,
+                        "status": "repair_error",
+                        "error": str(exc),
+                    }
+                    results.append(error)
+                    if not dry_run:
+                        append_jsonl(self.events_path, {
+                            "ts": now_iso(),
+                            "event": "visibility_notice_retry_failed",
+                            **error,
+                        })
                 continue
             first_status = first.get("status")
             start_age = iso_age_seconds(first.get("armedAt"))

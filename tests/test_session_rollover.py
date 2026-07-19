@@ -341,6 +341,56 @@ class RolloverTests(unittest.TestCase):
             self.assertEqual(current["handoffPath"], str(fresh_handoff_path))
             self.assertEqual(current["resetSafety"]["mode"], "reject_if_active")
 
+    def test_raced_reset_rejection_restores_ready_state_for_retry(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["thresholds"]["minIdleSeconds"] = 0
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "message", "message": {"role": "assistant", "content": "done"}}),
+                encoding="utf-8",
+            )
+            entry = {
+                "sessionId": "old-session",
+                "sessionFile": str(transcript),
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "ready_after_run",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "drainRun": {"runId": "run-1", "status": "completed"},
+            })
+            handoff_path = root / "fresh-handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            handoff = {
+                "handoffPath": str(handoff_path),
+                "continuityContext": "verified",
+            }
+            with patch.object(manager, "_handoff", return_value=handoff), patch.object(
+                manager,
+                "_gateway_reset",
+                side_effect=RuntimeError("Session is still active; try again in a moment."),
+            ):
+                result = manager._rollover_unlocked(
+                    "agent:main:project-test",
+                    force=True,
+                    trigger_override="post_run_idle",
+                )
+            self.assertEqual(result["action"], "reset_rejected_active")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "ready_after_run")
+            self.assertEqual(current["lastResetAttempt"]["status"], "rejected_active")
+
     def test_activate_pending_refuses_to_reset_a_running_generation(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -805,7 +855,8 @@ class RolloverTests(unittest.TestCase):
             record = current["sessions"]["agent:main:project-test"]
             self.assertEqual(record["status"], "active")
             self.assertEqual(record["visibilityNotice"]["status"], "pending_retry")
-            self.assertEqual(record["resetSafety"]["mode"], "reject_if_active")
+            self.assertEqual(record["resetSafety"]["mode"], "unknown_legacy")
+            self.assertFalse(record["resetSafety"]["verified"])
             self.assertNotIn("firstDispatch", record)
 
     def test_scan_auto_repairs_allowlisted_existing_rollover_once(self):
