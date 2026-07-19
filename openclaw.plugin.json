@@ -2,7 +2,7 @@
   "id": "openclaw-session-keeper",
   "name": "OpenClaw Session Keeper",
   "description": "Safe physical rollover and optional deterministic compaction for compatible OpenClaw runtimes.",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

@@ -51,23 +51,21 @@ export function readPendingRollover(statePath, sessionKey) {
   const record = readJson(statePath, null)?.sessions?.[sessionKey];
   if (
     !record
-    || !["pending_next_user", "prepared"].includes(record.status)
+    || record.status !== "pending_next_user"
     || !record.oldSessionId
   ) return null;
   return record;
 }
 
-export function readPendingFirstDispatch(statePath, sessionKey) {
+export function readPendingRolloverRun(statePath, sessionKey) {
   if (!sessionKey) return null;
   const record = readJson(statePath, null)?.sessions?.[sessionKey];
-  const firstDispatch = record?.firstDispatch;
   if (
-    record?.status !== "active"
-    || !record?.newSessionId
-    || !firstDispatch
-    || !["awaiting_agent_start", "started"].includes(firstDispatch.status)
+    !record
+    || !["pending_next_user", "draining_current_run"].includes(record.status)
+    || !record.oldSessionId
   ) return null;
-  return { record, firstDispatch };
+  return record;
 }
 
 async function runManagerCommand(options, commandArgs) {
@@ -102,7 +100,7 @@ export async function activatePendingRollover(options, sessionKey) {
   ]);
 }
 
-export async function recordFirstDispatchStart(options, sessionKey, runId, sessionId) {
+export async function recordRolloverRunStart(options, sessionKey, runId, sessionId) {
   const args = [
     "record-first-dispatch-start",
     "--session-key",
@@ -114,7 +112,7 @@ export async function recordFirstDispatchStart(options, sessionKey, runId, sessi
   return runManagerCommand(options, args);
 }
 
-export async function recordFirstDispatchEnd(options, sessionKey, runId, success) {
+export async function recordRolloverRunEnd(options, sessionKey, runId, success) {
   const args = [
     "record-first-dispatch-end",
     "--session-key",
@@ -126,12 +124,6 @@ export async function recordFirstDispatchEnd(options, sessionKey, runId, success
   ];
   if (!success) args.push("--error-code", "agent_run_failed");
   return runManagerCommand(options, args);
-}
-
-export function hasMeaningfulDispatchContent(event) {
-  return [event?.content, event?.body].some(
-    (value) => typeof value === "string" && value.trim().length > 0,
-  );
 }
 
 async function recordLifecycleWithRetry(operation, attempts = 3) {
@@ -146,98 +138,73 @@ async function recordLifecycleWithRetry(operation, attempts = 3) {
   throw new Error(`lifecycle_state_lock_busy_after_${attempts}_attempts`);
 }
 
-export function createDeferredRolloverHook(options, logger, activate = activatePendingRollover) {
-  return async (event, ctx) => {
-    const sessionKey = String(event?.sessionKey || ctx?.sessionKey || "").trim();
-    if (!sessionKey || !readPendingRollover(options.statePath, sessionKey)) {
-      return { handled: false };
-    }
-    if (!hasMeaningfulDispatchContent(event)) {
-      logger.info?.(
-        `openclaw-session-keeper: ignored empty dispatch while rollover pending session=${sessionKey}`,
-      );
-      return { handled: false };
-    }
-    try {
-      const result = await activate(options, sessionKey);
-      if (
-        ![
-          "pending_rollover_activated",
-          "pending_rollover_reconciled",
-          "no_pending_rollover",
-        ].includes(result?.action)
-      ) {
-        throw new Error(`unexpected_activation_result:${result?.action || "missing"}`);
-      }
-      logger.info?.(
-        `openclaw-session-keeper: deferred rollover activation ${result.action} session=${sessionKey}`,
-      );
-      return { handled: false };
-    } catch (error) {
-      logger.error?.(
-        `openclaw-session-keeper: deferred rollover activation failed session=${sessionKey}: ${error?.message ?? error}`,
-      );
-      return {
-        handled: true,
-        text: "⚠️ 会话已达安全换代阈值，但换代未能完成。本条任务未执行，也不会重复执行；请稍后重试。",
-      };
-    }
-  };
-}
-
-export function createFirstDispatchStartHook(
+export function createRolloverRunStartHook(
   options,
   logger,
-  recordStart = recordFirstDispatchStart,
+  recordStart = recordRolloverRunStart,
 ) {
   return async (_event, ctx) => {
     const sessionKey = String(ctx?.sessionKey || "").trim();
     const runId = String(ctx?.runId || "").trim();
-    const pending = readPendingFirstDispatch(options.statePath, sessionKey);
-    if (!pending || pending.firstDispatch.status !== "awaiting_agent_start" || !runId) return;
+    const pending = readPendingRolloverRun(options.statePath, sessionKey);
+    if (!pending || pending.status !== "pending_next_user" || !runId) {
+      return { outcome: "pass" };
+    }
     try {
       const result = await recordLifecycleWithRetry(
         () => recordStart(options, sessionKey, runId, ctx?.sessionId),
       );
-      if (!["first_dispatch_started", "first_dispatch_start_idempotent", "first_dispatch_already_finished"].includes(result?.action)) {
-        throw new Error(`unexpected_first_dispatch_start_result:${result?.action || "missing"}`);
+      if (![
+        "deferred_rollover_run_started",
+        "deferred_rollover_run_start_idempotent",
+        "deferred_rollover_already_draining",
+        "deferred_rollover_already_ready",
+        "no_pending_rollover",
+      ].includes(result?.action)) {
+        throw new Error(`unexpected_rollover_run_start_result:${result?.action || "missing"}`);
       }
       logger.info?.(
-        `openclaw-session-keeper: first dispatch started session=${sessionKey} run=${runId}`,
+        `openclaw-session-keeper: rollover boundary run observed session=${sessionKey} run=${runId}`,
       );
     } catch (error) {
-      // Observability must never consume a user task after rollover committed.
+      // Lifecycle tracking must never consume or interrupt the admitted task.
       logger.error?.(
-        `openclaw-session-keeper: first dispatch start tracking failed session=${sessionKey}: ${error?.message ?? error}`,
+        `openclaw-session-keeper: rollover run start tracking failed session=${sessionKey}: ${error?.message ?? error}`,
       );
     }
+    return { outcome: "pass" };
   };
 }
 
-export function createFirstDispatchEndHook(
+export function createRolloverRunEndHook(
   options,
   logger,
-  recordEnd = recordFirstDispatchEnd,
+  recordEnd = recordRolloverRunEnd,
 ) {
   return async (event, ctx) => {
     const sessionKey = String(ctx?.sessionKey || "").trim();
     const runId = String(event?.runId || ctx?.runId || "").trim();
-    const pending = readPendingFirstDispatch(options.statePath, sessionKey);
-    if (!pending || pending.firstDispatch.status !== "started" || !runId) return;
-    if (String(pending.firstDispatch.runId || "") !== runId) return;
+    const pending = readPendingRolloverRun(options.statePath, sessionKey);
+    if (!pending || pending.status !== "draining_current_run" || !runId) return;
+    if (String(pending.drainRun?.runId || "") !== runId) return;
     try {
       const result = await recordLifecycleWithRetry(
         () => recordEnd(options, sessionKey, runId, event?.success === true),
       );
-      if (!["first_dispatch_completed", "first_dispatch_failed", "first_dispatch_end_idempotent"].includes(result?.action)) {
-        throw new Error(`unexpected_first_dispatch_end_result:${result?.action || "missing"}`);
+      if (![
+        "deferred_rollover_run_completed",
+        "deferred_rollover_run_failed",
+        "deferred_rollover_run_end_idempotent",
+        "no_draining_rollover",
+      ].includes(result?.action)) {
+        throw new Error(`unexpected_rollover_run_end_result:${result?.action || "missing"}`);
       }
       logger.info?.(
-        `openclaw-session-keeper: first dispatch finished session=${sessionKey} run=${runId} success=${event?.success === true}`,
+        `openclaw-session-keeper: rollover boundary run finished session=${sessionKey} run=${runId} success=${event?.success === true}`,
       );
     } catch (error) {
       logger.error?.(
-        `openclaw-session-keeper: first dispatch end tracking failed session=${sessionKey}: ${error?.message ?? error}`,
+        `openclaw-session-keeper: rollover run end tracking failed session=${sessionKey}: ${error?.message ?? error}`,
       );
     }
   };
@@ -270,19 +237,16 @@ export default {
     });
     const deferredOptions = resolveDeferredRolloverOptions(api.pluginConfig ?? {});
     if (deferredOptions.enabled) {
-      api.on(
-        "before_dispatch",
-        createDeferredRolloverHook(deferredOptions, api.logger ?? console),
-      );
+      const logger = api.logger ?? console;
       api.on(
         "before_agent_run",
-        createFirstDispatchStartHook(deferredOptions, api.logger ?? console),
+        createRolloverRunStartHook(deferredOptions, logger),
       );
       api.on(
         "agent_end",
-        createFirstDispatchEndHook(deferredOptions, api.logger ?? console),
+        createRolloverRunEndHook(deferredOptions, logger),
       );
-      api.logger?.info?.("openclaw-session-keeper: deferred rollover hook active");
+      api.logger?.info?.("openclaw-session-keeper: non-interrupting deferred rollover hooks active");
     }
   },
 };

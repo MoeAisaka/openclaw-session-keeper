@@ -4,7 +4,7 @@ Safe physical-session rollover behind stable OpenClaw project session keys.
 
 Long-running agent sessions eventually become expensive, brittle, or difficult to recover. Session Keeper creates a verified handoff, rotates the physical session only while it is idle, and keeps the stable project entry intact.
 
-Version 0.3 can defer normal physical rollover until the next nonempty user message: the scanner prepares a verified handoff at the threshold, then an awaited pre-dispatch hook rotates the physical session before that message is sent to the agent. Empty startup, reconnect, or view-only dispatches are ignored. The completed answer therefore remains visible for review. Emergency rollover is still immediate. Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
+Version 0.3.3 defers normal physical rollover until one real post-threshold Agent run has completed. `before_agent_run` records the boundary run and always passes it; `agent_end` marks the rollover ready; the idle scanner then builds a fresh handoff and requests an atomic reject-if-active reset. Startup, reconnect and view-only traffic cannot rotate the session because they do not start an Agent run. Emergency rollover remains immediate but uses the same non-interrupting core reset. Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
 
 ## Measured cost model
 
@@ -31,7 +31,7 @@ formulas, caveats, and official pricing sources.
 - User-selected provider/model overrides
 - Thinking preferences and, when explicitly enabled, the user's current Standard/Fast choice
 - An idempotent, operator-visible rollover notice
-- Optional deferred normal rollover that activates before the next inbound task is dispatched
+- Optional deferred normal rollover after the next real Agent run completes
 
 ## Safety model
 
@@ -42,13 +42,14 @@ formulas, caveats, and official pricing sources.
 - The optional Codex binding check opens the configured SQLite database read-only.
 - Deterministic compaction uses bounded one-pass retention instead of copying the full normalized transcript.
 - Emergency recovery backs up first, then calls the official `sessions.compact --max-lines` Gateway RPC. It never rewrites an active transcript or `sessions.json` directly.
-- Deferred activation is awaited and fail closed: if reset verification fails, the inbound task is not executed and can be retried safely.
-- The deferred hook never logs or persists the inbound prompt.
+- Deferred lifecycle tracking never blocks, rejects, logs or persists the inbound prompt.
+- Physical reset uses `interruptActiveWork=false`; the OpenClaw lifecycle lock rejects a raced reset instead of aborting admitted work.
 
 ## Requirements
 
 - Python 3.10+
 - OpenClaw with `gateway call sessions.reset`, `sessions.patch`, `chat.history`, and `chat.inject`
+- The version-gated non-interrupting reset extension documented in the production deployment notes; without it Keeper fails closed and will not rotate
 - macOS or Linux with `fcntl`
 - Optional: nmem for semantic recall
 - Optional: Codex app-server state inspection
@@ -121,15 +122,17 @@ role-agent sessions that must always run in Standard mode.
 
 `rolloverTiming.deferUntilNextUserMessage` is also opt-in. When enabled, the
 scanner arms normal threshold rollovers without changing the current physical
-session. The plugin's awaited `before_dispatch` hook ignores empty or
-whitespace-only dispatches, activates the pending rollover on the first real
-user task, and then lets that task continue in the new session. A
-busy operator-visible notice is auxiliary after the reset commits and cannot
-consume that triggering message. The handoff carries a bounded previous
+session. The next real `before_agent_run` marks the admitted task as the
+boundary run and explicitly lets it proceed on the original generation.
+`agent_end` records completion, and the periodic scanner waits for idle before
+building a fresh handoff and requesting an atomic reject-if-active reset.
+Concurrent or queued tasks continue normally; if one races the reset, the core
+rejects that reset and the scanner retries later. The hooks never inspect,
+persist or replay the prompt. The handoff carries a bounded previous
 assistant outcome plus an explicit continuation decision derived from Workflow
-Ledger state and visible turn order. `before_agent_run` and `agent_end` record
-whether the first new-generation run actually started and finished. Emergency
-thresholds and retired Codex-binding recovery remain immediate. The hook must
+Ledger state and visible turn order. Emergency thresholds and retired
+Codex-binding recovery remain immediate but use the same non-interrupting
+reset contract. The hooks must
 point to this repository's manager script, production configuration and state
 file through the plugin's `deferredRollover` settings.
 

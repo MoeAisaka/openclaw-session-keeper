@@ -30,7 +30,7 @@ DEFAULT_CONFIG = Path(
         Path.home() / ".config" / "openclaw-session-keeper" / "config.json",
     )
 ).expanduser()
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 ACTIVE_TASK_STATUSES = {"planned", "in_progress", "waiting", "blocked"}
 IDLE_STATUSES = {None, "", "done", "idle", "killed", "failed", "timed_out", "cancelled"}
 PATH_RE = re.compile(
@@ -937,7 +937,13 @@ class RolloverManager:
         atomic_write_json(self.current_path, current)
 
     def _gateway_reset(self, session_key: str) -> dict[str, Any]:
-        return self._gateway_call("sessions.reset", {"key": session_key, "reason": "reset"})
+        # The production core extension makes this an atomic reject-if-active
+        # lifecycle mutation. Never let Session Keeper abort admitted work.
+        return self._gateway_call("sessions.reset", {
+            "key": session_key,
+            "reason": "reset",
+            "interruptActiveWork": False,
+        })
 
     def _activation_value(
         self,
@@ -948,10 +954,6 @@ class RolloverManager:
         verification: str = "verified",
         visibility_notice: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        handoff = read_json(Path(str(prepared.get("handoffPath") or "")), {})
-        decision = handoff.get("continuationDecision") if isinstance(handoff, dict) else {}
-        if not isinstance(decision, dict):
-            decision = {}
         return {
             **prepared,
             "status": "active",
@@ -960,12 +962,9 @@ class RolloverManager:
             "activatedAt": now_iso(),
             "verification": verification,
             "visibilityNotice": visibility_notice or {"status": "disabled"},
-            "firstDispatch": {
-                "status": "awaiting_agent_start",
-                "newSessionId": new_session_id,
-                "continuationAction": decision.get("action", "manual_review_required"),
-                "shouldAutoContinue": bool(decision.get("shouldAutoContinue", False)),
-                "armedAt": now_iso(),
+            "resetSafety": {
+                "mode": "reject_if_active",
+                "verifiedAt": now_iso(),
             },
             "gatewayResponse": {
                 "ok": (response or {}).get("ok"),
@@ -1007,13 +1006,17 @@ class RolloverManager:
         existing = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
         if (
             isinstance(existing, dict)
-            and existing.get("status") == "pending_next_user"
+            and existing.get("status") in {
+                "pending_next_user",
+                "draining_current_run",
+                "ready_after_run",
+            }
             and existing.get("oldSessionId") == entry.get("sessionId")
             and Path(str(existing.get("handoffPath") or "")).is_file()
         ):
             return {
                 "sessionKey": session_key,
-                "action": "rollover_pending_next_user",
+                "action": f"rollover_{existing.get('status')}",
                 "tokens": tokens,
                 "sessionId": entry.get("sessionId"),
                 "armedAt": existing.get("armedAt"),
@@ -1069,13 +1072,16 @@ class RolloverManager:
         dry_run: bool = False,
         trigger_override: str = "next_user_message",
     ) -> dict[str, Any]:
-        """Rotate a previously armed generation immediately before dispatch."""
+        """Manually rotate an armed generation only when the core can reject active work."""
         spec = self.config.get("sessions", {}).get(session_key)
         if not isinstance(spec, dict):
             raise RuntimeError("session_not_allowlisted")
         current = read_json(self.current_path, {"sessions": {}})
         record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
-        if not isinstance(record, dict) or record.get("status") not in {"pending_next_user", "prepared"}:
+        if not isinstance(record, dict) or record.get("status") not in {
+            "pending_next_user",
+            "prepared",
+        }:
             return {"sessionKey": session_key, "action": "no_pending_rollover"}
         entry = self._sessions().get(session_key)
         if not isinstance(entry, dict):
@@ -1083,6 +1089,12 @@ class RolloverManager:
         old_session_id = str(record.get("oldSessionId") or "")
         if not old_session_id or str(entry.get("sessionId") or "") != old_session_id:
             raise RuntimeError("pending_rollover_generation_mismatch")
+        if not self._is_idle(entry):
+            return {
+                "sessionKey": session_key,
+                "action": "pending_busy",
+                "status": entry.get("status"),
+            }
         handoff_path = Path(str(record.get("handoffPath") or ""))
         if not handoff_path.is_file():
             raise RuntimeError("pending_rollover_handoff_missing")
@@ -1250,41 +1262,49 @@ class RolloverManager:
         run_id: str,
         session_id: str | None = None,
     ) -> dict[str, Any]:
-        """Record that the first agent run in the new generation really started."""
+        """Mark the first real post-threshold run; never reset from this hook."""
         with self._lock() as acquired:
             if not acquired:
                 return {"ok": True, "sessionKey": session_key, "action": "lock_busy"}
             current = read_json(self.current_path, {"sessions": {}})
             record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
-            if not isinstance(record, dict) or record.get("status") != "active":
-                return {"ok": True, "sessionKey": session_key, "action": "no_active_rollover"}
-            first = record.get("firstDispatch")
-            if not isinstance(first, dict):
-                return {"ok": True, "sessionKey": session_key, "action": "no_pending_first_dispatch"}
-            if session_id and str(record.get("newSessionId") or "") != str(session_id):
-                raise RuntimeError("first_dispatch_generation_mismatch")
-            if first.get("status") == "started" and first.get("runId") == run_id:
-                return {"ok": True, "sessionKey": session_key, "action": "first_dispatch_start_idempotent"}
-            if first.get("status") in {"completed", "failed"}:
-                return {"ok": True, "sessionKey": session_key, "action": "first_dispatch_already_finished"}
-            if first.get("status") != "awaiting_agent_start":
-                raise RuntimeError("first_dispatch_start_state_invalid")
-            started = {
-                **first,
-                "status": "started",
+            if not isinstance(record, dict):
+                return {"ok": True, "sessionKey": session_key, "action": "no_pending_rollover"}
+            status = record.get("status")
+            drain = record.get("drainRun") if isinstance(record.get("drainRun"), dict) else {}
+            if status == "draining_current_run":
+                action = (
+                    "deferred_rollover_run_start_idempotent"
+                    if drain.get("runId") == run_id
+                    else "deferred_rollover_already_draining"
+                )
+                return {"ok": True, "sessionKey": session_key, "action": action}
+            if status == "ready_after_run":
+                return {"ok": True, "sessionKey": session_key, "action": "deferred_rollover_already_ready"}
+            if status != "pending_next_user":
+                return {"ok": True, "sessionKey": session_key, "action": "no_pending_rollover"}
+            old_session_id = str(record.get("oldSessionId") or "")
+            if session_id and old_session_id != str(session_id):
+                raise RuntimeError("deferred_rollover_generation_mismatch")
+            drain = {
                 "runId": run_id,
+                "sessionId": session_id or old_session_id,
                 "startedAt": now_iso(),
             }
-            self._update_current(session_key, {**record, "firstDispatch": started})
+            self._update_current(session_key, {
+                **record,
+                "status": "draining_current_run",
+                "drainRun": drain,
+            })
             event = {
                 "ts": now_iso(),
-                "event": "first_dispatch_started",
+                "event": "deferred_rollover_run_started",
                 "sessionKey": session_key,
-                "newSessionId": record.get("newSessionId"),
+                "oldSessionId": old_session_id,
                 "runId": run_id,
             }
             append_jsonl(self.events_path, event)
-            return {"ok": True, "action": "first_dispatch_started", **event}
+            return {"ok": True, "action": "deferred_rollover_run_started", **event}
 
     def record_first_dispatch_end(
         self,
@@ -1294,49 +1314,46 @@ class RolloverManager:
         success: bool,
         error_code: str | None = None,
     ) -> dict[str, Any]:
-        """Record completion without persisting prompts, replies, or raw errors."""
+        """Mark the boundary run finished; the idle scanner performs the reset later."""
         with self._lock() as acquired:
             if not acquired:
                 return {"ok": True, "sessionKey": session_key, "action": "lock_busy"}
             current = read_json(self.current_path, {"sessions": {}})
             record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
-            if not isinstance(record, dict) or record.get("status") != "active":
-                return {"ok": True, "sessionKey": session_key, "action": "no_active_rollover"}
-            first = record.get("firstDispatch")
-            if not isinstance(first, dict):
-                return {"ok": True, "sessionKey": session_key, "action": "no_pending_first_dispatch"}
-            if first.get("status") in {"completed", "failed"} and first.get("runId") == run_id:
-                return {"ok": True, "sessionKey": session_key, "action": "first_dispatch_end_idempotent"}
-            if first.get("status") != "started" or first.get("runId") != run_id:
-                raise RuntimeError("first_dispatch_end_state_invalid")
+            if not isinstance(record, dict):
+                return {"ok": True, "sessionKey": session_key, "action": "no_draining_rollover"}
+            drain = record.get("drainRun") if isinstance(record.get("drainRun"), dict) else {}
+            if record.get("status") == "ready_after_run" and drain.get("runId") == run_id:
+                return {
+                    "ok": True,
+                    "sessionKey": session_key,
+                    "action": "deferred_rollover_run_end_idempotent",
+                }
+            if record.get("status") != "draining_current_run" or drain.get("runId") != run_id:
+                return {"ok": True, "sessionKey": session_key, "action": "no_draining_rollover"}
             finished = {
-                **first,
+                **drain,
                 "status": "completed" if success else "failed",
                 "success": success,
                 "finishedAt": now_iso(),
             }
             if error_code:
                 finished["errorCode"] = error_code[:120]
-            visibility = record.get("visibilityNotice")
-            if success and isinstance(visibility, dict) and visibility.get("status") in {
-                "deferred_until_first_dispatch_complete",
-                "pending_retry",
-            }:
-                visibility = {
-                    **visibility,
-                    "status": "superseded_by_completed_first_dispatch",
-                    "supersededAt": now_iso(),
-                }
             self._update_current(session_key, {
                 **record,
-                "firstDispatch": finished,
-                "visibilityNotice": visibility,
+                "status": "ready_after_run",
+                "drainRun": finished,
+                "readyAt": now_iso(),
             })
             event = {
                 "ts": now_iso(),
-                "event": "first_dispatch_completed" if success else "first_dispatch_failed",
+                "event": (
+                    "deferred_rollover_run_completed"
+                    if success
+                    else "deferred_rollover_run_failed"
+                ),
                 "sessionKey": session_key,
-                "newSessionId": record.get("newSessionId"),
+                "oldSessionId": record.get("oldSessionId"),
                 "runId": run_id,
                 "success": success,
             }
@@ -1649,11 +1666,6 @@ class RolloverManager:
             first = record.get("firstDispatch")
             if not isinstance(visibility, dict) or not isinstance(first, dict):
                 continue
-            if visibility.get("status") not in {
-                "deferred_until_first_dispatch_complete",
-                "pending_retry",
-            }:
-                continue
             first_status = first.get("status")
             start_age = iso_age_seconds(first.get("armedAt"))
             start_timed_out = (
@@ -1662,6 +1674,40 @@ class RolloverManager:
                 and start_age >= int(config["firstDispatchStartTimeoutSeconds"])
             )
             if first_status != "failed" and not start_timed_out:
+                continue
+            if start_timed_out:
+                timeout_result = {
+                    "sessionKey": session_key,
+                    "status": "start_timeout",
+                    "firstDispatchStatus": first_status,
+                    "startTimedOut": True,
+                    "visibilityStatus": visibility.get("status"),
+                }
+                results.append(timeout_result)
+                if not dry_run:
+                    updated_first = {
+                        **first,
+                        "status": "start_timeout",
+                        "startTimeoutDetectedAt": now_iso(),
+                    }
+                    self._update_current(session_key, {
+                        **record,
+                        "firstDispatch": updated_first,
+                    })
+                    append_jsonl(self.events_path, {
+                        "ts": now_iso(),
+                        "event": "first_dispatch_start_timed_out",
+                        "sessionKey": session_key,
+                        "newSessionId": record.get("newSessionId"),
+                        "visibilityStatus": visibility.get("status"),
+                    })
+                    first = updated_first
+                if visibility.get("status") == "verified":
+                    continue
+            if visibility.get("status") not in {
+                "deferred_until_first_dispatch_complete",
+                "pending_retry",
+            }:
                 continue
             new_session_id = str(record.get("newSessionId") or "")
             if not new_session_id:
@@ -1679,12 +1725,12 @@ class RolloverManager:
                     "startTimedOut": start_timed_out,
                     **result,
                 }
-                results.append(output)
+                if not start_timed_out:
+                    results.append(output)
                 if dry_run or result.get("status") != "verified":
                     continue
                 updated_first = {
                     **first,
-                    **({"status": "start_timeout"} if start_timed_out else {}),
                     "continuityNoticeVerifiedAt": now_iso(),
                 }
                 self._update_current(session_key, {
@@ -1808,15 +1854,20 @@ class RolloverManager:
                 action = decision["action"]
                 current = read_json(self.current_path, {"sessions": {}})
                 current_record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
-                pending_current_generation = (
+                deferred_statuses = {
+                    "pending_next_user",
+                    "draining_current_run",
+                    "ready_after_run",
+                }
+                deferred_current_generation = (
                     isinstance(current_record, dict)
-                    and current_record.get("status") == "pending_next_user"
+                    and current_record.get("status") in deferred_statuses
                     and current_record.get("oldSessionId") == entry.get("sessionId")
                 )
                 if (
                     isinstance(current_record, dict)
-                    and current_record.get("status") == "pending_next_user"
-                    and not pending_current_generation
+                    and current_record.get("status") in deferred_statuses
+                    and not deferred_current_generation
                     and not dry_run
                 ):
                     self._update_current(session_key, {
@@ -1825,16 +1876,85 @@ class RolloverManager:
                         "supersededAt": now_iso(),
                         "observedSessionId": entry.get("sessionId"),
                     })
+                if deferred_current_generation:
+                    deferred_status = current_record.get("status")
+                    if deferred_status == "pending_next_user":
+                        if action != "emergency":
+                            results.append({
+                                "sessionKey": session_key,
+                                "action": "rollover_awaiting_agent_run",
+                                "tokens": tokens,
+                                "status": entry.get("status"),
+                            })
+                            continue
+                    elif deferred_status == "draining_current_run":
+                        if not self._is_idle(entry):
+                            results.append({
+                                "sessionKey": session_key,
+                                "action": "rollover_run_draining",
+                                "tokens": tokens,
+                                "status": entry.get("status"),
+                                "runId": (current_record.get("drainRun") or {}).get("runId"),
+                            })
+                            continue
+                        if dry_run:
+                            results.append({
+                                "sessionKey": session_key,
+                                "action": "would_reconcile_rollover_run_end",
+                                "tokens": tokens,
+                            })
+                            continue
+                        drain = current_record.get("drainRun") or {}
+                        current_record = {
+                            **current_record,
+                            "status": "ready_after_run",
+                            "drainRun": {
+                                **drain,
+                                "status": "lifecycle_reconciled_idle",
+                                "finishedAt": now_iso(),
+                            },
+                            "readyAt": now_iso(),
+                        }
+                        self._update_current(session_key, current_record)
+                    if deferred_status in {"ready_after_run", "draining_current_run"}:
+                        if not self._is_idle(entry):
+                            results.append({
+                                "sessionKey": session_key,
+                                "action": "post_run_rollover_waiting_idle",
+                                "tokens": tokens,
+                                "status": entry.get("status"),
+                            })
+                            continue
+                        try:
+                            results.append(self._rollover_unlocked(
+                                session_key,
+                                force=True,
+                                dry_run=dry_run,
+                                trigger_override="post_run_idle",
+                            ))
+                        except Exception as exc:
+                            error = {
+                                "sessionKey": session_key,
+                                "action": "post_run_rollover_error",
+                                "error": str(exc),
+                                "tokens": tokens,
+                            }
+                            results.append(error)
+                            if not dry_run:
+                                append_jsonl(self.events_path, {
+                                    "ts": now_iso(),
+                                    "event": "post_run_rollover_failed",
+                                    **error,
+                                })
+                        continue
                 if action == "emergency":
                     try:
-                        if pending_current_generation:
-                            results.append(self._activate_pending_unlocked(
-                                session_key,
-                                dry_run=dry_run,
-                                trigger_override=decision["reason"],
-                            ))
-                        else:
-                            results.append(self._rollover_unlocked(session_key, dry_run=dry_run))
+                        results.append(self._rollover_unlocked(
+                            session_key,
+                            force=deferred_current_generation,
+                            dry_run=dry_run,
+                            trigger_override=decision["reason"],
+                        ))
                     except Exception as exc:
                         error = {"sessionKey": session_key, "action": "error", "error": str(exc), "tokens": tokens}
                         results.append(error)
