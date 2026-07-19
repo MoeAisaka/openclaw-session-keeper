@@ -128,6 +128,12 @@ export async function recordFirstDispatchEnd(options, sessionKey, runId, success
   return runManagerCommand(options, args);
 }
 
+export function hasMeaningfulDispatchContent(event) {
+  return [event?.content, event?.body].some(
+    (value) => typeof value === "string" && value.trim().length > 0,
+  );
+}
+
 async function recordLifecycleWithRetry(operation, attempts = 3) {
   let lastResult;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -144,6 +150,12 @@ export function createDeferredRolloverHook(options, logger, activate = activateP
   return async (event, ctx) => {
     const sessionKey = String(event?.sessionKey || ctx?.sessionKey || "").trim();
     if (!sessionKey || !readPendingRollover(options.statePath, sessionKey)) {
+      return { handled: false };
+    }
+    if (!hasMeaningfulDispatchContent(event)) {
+      logger.info?.(
+        `openclaw-session-keeper: ignored empty dispatch while rollover pending session=${sessionKey}`,
+      );
       return { handled: false };
     }
     try {

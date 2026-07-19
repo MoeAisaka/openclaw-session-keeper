@@ -4,7 +4,7 @@ Safe physical-session rollover behind stable OpenClaw project session keys.
 
 Long-running agent sessions eventually become expensive, brittle, or difficult to recover. Session Keeper creates a verified handoff, rotates the physical session only while it is idle, and keeps the stable project entry intact.
 
-Version 0.3 can defer normal physical rollover until the next user message: the scanner prepares a verified handoff at the threshold, then an awaited pre-dispatch hook rotates the physical session before that message is sent to the agent. The completed answer therefore remains visible for review. Emergency rollover is still immediate. Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
+Version 0.3 can defer normal physical rollover until the next nonempty user message: the scanner prepares a verified handoff at the threshold, then an awaited pre-dispatch hook rotates the physical session before that message is sent to the agent. Empty startup, reconnect, or view-only dispatches are ignored. The completed answer therefore remains visible for review. Emergency rollover is still immediate. Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
 
 ## Measured cost model
 
@@ -121,8 +121,9 @@ role-agent sessions that must always run in Standard mode.
 
 `rolloverTiming.deferUntilNextUserMessage` is also opt-in. When enabled, the
 scanner arms normal threshold rollovers without changing the current physical
-session. The plugin's awaited `before_dispatch` hook activates the pending
-rollover and then lets the original inbound task continue in the new session. A
+session. The plugin's awaited `before_dispatch` hook ignores empty or
+whitespace-only dispatches, activates the pending rollover on the first real
+user task, and then lets that task continue in the new session. A
 busy operator-visible notice is auxiliary after the reset commits and cannot
 consume that triggering message. The handoff carries a bounded previous
 assistant outcome plus an explicit continuation decision derived from Workflow

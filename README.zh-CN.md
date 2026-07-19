@@ -4,7 +4,7 @@
 
 它会在会话空闲时生成带校验的交接包，再通过 Gateway 官方接口重置物理 `sessionId`，同时保留稳定 `sessionKey`、项目标签、用户手动模型选择、思考等级，以及显式启用后的当前 Standard/Fast 选择。
 
-V0.3.1 补齐了换代后的工作连续性：交接包会保存上一轮最终答复节选，并根据 Workflow Ledger 与消息顺序生成明确的续跑决策；新物理会话的首个 Agent 运行通过 `before_agent_run` / `agent_end` 单独确认。普通阈值仍延后到下一条用户消息，等待型 `before_dispatch` 钩子会先完成物理换代，再让原任务继续分发；即使通知注入因会话正忙而延后，也不会再吞掉这条用户消息。应急阈值仍立即换代。V0.2 新增了面向兼容内嵌 Runtime 的确定性压缩 Provider，并将超大会话恢复纳入 OpenClaw Gateway 生命周期锁。原生托管 Codex 会话由 OpenClaw `2026.7.1` 自行接管压缩，必须按下述兼容策略配置。
+V0.3.2 补齐了换代后的工作连续性：交接包会保存上一轮最终答复节选，并根据 Workflow Ledger 与消息顺序生成明确的续跑决策；新物理会话的首个 Agent 运行通过 `before_agent_run` / `agent_end` 单独确认。普通阈值仍延后到下一条非空用户消息，等待型 `before_dispatch` 钩子会忽略启动、重连或仅查看页面产生的空白事件，只在真实任务到达时先完成物理换代，再让原任务继续分发；即使通知注入因会话正忙而延后，也不会再吞掉这条用户消息。应急阈值仍立即换代。V0.2 新增了面向兼容内嵌 Runtime 的确定性压缩 Provider，并将超大会话恢复纳入 OpenClaw Gateway 生命周期锁。原生托管 Codex 会话由 OpenClaw `2026.7.1` 自行接管压缩，必须按下述兼容策略配置。
 
 ## Token 与费用对比
 
@@ -92,7 +92,7 @@ python3 session_rollover.py scan --dry-run
 
 `allowManualFastMode` 需要按会话显式开启。配置中的 `fastMode` 仍是默认值；开启后，Keeper 会在巡检和物理换代时保留用户当前选择的布尔值，而不会再次把显式 Fast 选择强制改回默认 Standard。无人值守任务和必须固定 Standard 的角色 Agent 不应开启此选项。
 
-`rolloverTiming.deferUntilNextUserMessage` 也需要显式开启。开启后，普通阈值只会进入 `pending_next_user` 状态；下一条用户消息到达时，插件的等待型 `before_dispatch` 钩子先激活换代，再让原消息在新物理会话中继续。若新会话在该分发窗口中处于 `running`，用户可见通知会降级为辅助状态，不再阻断原消息；`before_agent_run` 与 `agent_end` 会把首个新会话运行记录为开始、完成或失败。交接包中的 `continuationDecision` 只在存在明确的活动 Workflow Ledger 任务或旧会话以未答复用户消息结束时建议继续，已答复且无活动工作流时明确禁止静默重跑。应急阈值与已退役 Codex 绑定恢复仍立即执行。插件的 `deferredRollover` 配置必须指向本仓库管理器脚本、生产配置与状态文件。
+`rolloverTiming.deferUntilNextUserMessage` 也需要显式开启。开启后，普通阈值只会进入 `pending_next_user` 状态；空白入站事件不会激活换代，下一条非空用户消息到达时，插件的等待型 `before_dispatch` 钩子才先激活换代，再让原消息在新物理会话中继续。若新会话在该分发窗口中处于 `running`，用户可见通知会降级为辅助状态，不再阻断原消息；`before_agent_run` 与 `agent_end` 会把首个新会话运行记录为开始、完成或失败。交接包中的 `continuationDecision` 只在存在明确的活动 Workflow Ledger 任务或旧会话以未答复用户消息结束时建议继续，已答复且无活动工作流时明确禁止静默重跑。应急阈值与已退役 Codex 绑定恢复仍立即执行。插件的 `deferredRollover` 配置必须指向本仓库管理器脚本、生产配置与状态文件。
 
 常用命令：
 

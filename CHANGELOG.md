@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-19
+
+### Fixed
+
+- Ignore empty or whitespace-only `before_dispatch` events while a normal rollover is pending, so reconnect, startup, or view-only traffic cannot rotate the physical session before a real user task arrives.
+- Inspect dispatch content only for an in-memory nonempty check; never log or persist the content.
+
 ## [0.3.1] - 2026-07-19
 
 ### Fixed

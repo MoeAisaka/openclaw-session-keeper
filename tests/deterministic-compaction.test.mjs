@@ -9,6 +9,7 @@ import plugin, {
   createDeferredRolloverHook,
   createFirstDispatchEndHook,
   createFirstDispatchStartHook,
+  hasMeaningfulDispatchContent,
   readPendingFirstDispatch,
   readPendingRollover,
   resolveDeferredRolloverOptions,
@@ -213,12 +214,50 @@ test("before_dispatch activates pending rollover and lets the original task cont
     },
   );
   const result = await hook(
-    { sessionKey: "agent:main:project-example" },
+    { sessionKey: "agent:main:project-example", content: "continue this task" },
     {},
   );
   assert.deepEqual(calls, ["agent:main:project-example"]);
   assert.deepEqual(result, { handled: false });
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("before_dispatch ignores an empty dispatch and keeps the rollover pending", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-keeper-"));
+  const statePath = path.join(root, "current.json");
+  fs.writeFileSync(statePath, JSON.stringify({
+    sessions: {
+      "agent:main:project-example": {
+        status: "pending_next_user",
+        oldSessionId: "old-session",
+      },
+    },
+  }));
+  let activationCalls = 0;
+  const hook = createDeferredRolloverHook(
+    { statePath },
+    { info() {}, error() {} },
+    async () => {
+      activationCalls += 1;
+      return { action: "pending_rollover_activated" };
+    },
+  );
+  const result = await hook(
+    { sessionKey: "agent:main:project-example", content: "  \n", body: "" },
+    {},
+  );
+  assert.equal(activationCalls, 0);
+  assert.deepEqual(result, { handled: false });
+  assert.equal(
+    readPendingRollover(statePath, "agent:main:project-example").oldSessionId,
+    "old-session",
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("before_dispatch treats a nonempty normalized body as meaningful", () => {
+  assert.equal(hasMeaningfulDispatchContent({ content: "", body: "actual task" }), true);
+  assert.equal(hasMeaningfulDispatchContent({ content: "\t", body: "\n" }), false);
 });
 
 test("before_dispatch fails closed without logging or echoing the user prompt", async () => {
