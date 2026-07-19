@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
-import plugin, { COMPACTION_PROVIDER_ID } from "../src/index.js";
+import plugin, {
+  COMPACTION_PROVIDER_ID,
+  createRolloverRunEndHook,
+  createRolloverRunStartHook,
+  readPendingRolloverRun,
+  readPendingRollover,
+  resolveDeferredRolloverOptions,
+} from "../src/index.js";
 import {
   buildDeterministicSummary,
   redactSecrets,
@@ -139,4 +149,134 @@ test("option coercion stays within safe bounds", () => {
     maxItemsPerSection: 40,
     maxItemChars: 1600,
   });
+});
+
+test("deferred rollover options are disabled by default and bounded", () => {
+  const options = resolveDeferredRolloverOptions({
+    deferredRollover: { enabled: true, timeoutMs: 999999 },
+  });
+  assert.equal(options.enabled, true);
+  assert.equal(options.timeoutMs, 60000);
+  assert.match(options.managerScriptPath, /session_rollover\.py$/);
+});
+
+test("reads only deferred rollover lifecycle states", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-keeper-"));
+  const statePath = path.join(root, "current.json");
+  fs.writeFileSync(statePath, JSON.stringify({
+    sessions: {
+      "agent:main:project-example": {
+        status: "pending_next_user",
+        oldSessionId: "old-session",
+      },
+      "agent:main:test-active": {
+        status: "active",
+        oldSessionId: "old-session",
+      },
+      "agent:main:test-draining": {
+        status: "draining_current_run",
+        oldSessionId: "old-session",
+        drainRun: { runId: "run-1" },
+      },
+      "agent:main:project-test": {
+        status: "prepared",
+        oldSessionId: "old-session",
+      },
+    },
+  }));
+  assert.equal(
+    readPendingRollover(statePath, "agent:main:project-example").oldSessionId,
+    "old-session",
+  );
+  assert.equal(readPendingRollover(statePath, "agent:main:test-active"), null);
+  assert.equal(readPendingRollover(statePath, "agent:main:project-test"), null);
+  assert.equal(
+    readPendingRolloverRun(statePath, "agent:main:test-draining").drainRun.runId,
+    "run-1",
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("tracks the post-threshold run without reading prompt content or blocking it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-keeper-"));
+  const statePath = path.join(root, "current.json");
+  const writeState = (status, runId) => fs.writeFileSync(statePath, JSON.stringify({
+    sessions: {
+      "agent:main:project-example": {
+        status,
+        oldSessionId: "old-session",
+        ...(runId ? { drainRun: { runId } } : {}),
+      },
+    },
+  }));
+  writeState("pending_next_user");
+
+  const calls = [];
+  const startHook = createRolloverRunStartHook(
+    { statePath },
+    { info() {}, error() {} },
+    async (_options, sessionKey, runId, sessionId) => {
+      calls.push(["start", sessionKey, runId, sessionId]);
+      writeState("draining_current_run", runId);
+      return { action: "deferred_rollover_run_started" };
+    },
+  );
+  const gate = await startHook(
+    { prompt: "must-not-be-read" },
+    {
+      sessionKey: "agent:main:project-example",
+      sessionId: "old-session",
+      runId: "run-1",
+    },
+  );
+  assert.deepEqual(gate, { outcome: "pass" });
+
+  const endHook = createRolloverRunEndHook(
+    { statePath },
+    { info() {}, error() {} },
+    async (_options, sessionKey, runId, success) => {
+      calls.push(["end", sessionKey, runId, success]);
+      return { action: "deferred_rollover_run_completed" };
+    },
+  );
+  await endHook(
+    { runId: "run-1", success: true, messages: ["must-not-be-read"] },
+    { sessionKey: "agent:main:project-example", runId: "run-1" },
+  );
+  assert.deepEqual(calls, [
+    ["start", "agent:main:project-example", "run-1", "old-session"],
+    ["end", "agent:main:project-example", "run-1", true],
+  ]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("before_agent_run explicitly passes when no rollover is pending", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-keeper-"));
+  const statePath = path.join(root, "current.json");
+  fs.writeFileSync(statePath, JSON.stringify({ sessions: {} }));
+  const hook = createRolloverRunStartHook(
+    { statePath },
+    { info() {}, error() {} },
+    async () => { throw new Error("must not be called"); },
+  );
+  const result = await hook({}, {
+    sessionKey: "agent:main:project-example",
+    sessionId: "old-session",
+    runId: "run-1",
+  });
+  assert.deepEqual(result, { outcome: "pass" });
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("plugin registers only run lifecycle hooks for deferred rollover", () => {
+  const hooks = [];
+  plugin.register({
+    pluginConfig: {
+      deferredRollover: { enabled: true },
+    },
+    registerCompactionProvider() {},
+    on(name) { hooks.push(name); },
+    logger: { info() {}, error() {} },
+  });
+  assert.deepEqual(hooks, ["before_agent_run", "agent_end"]);
 });

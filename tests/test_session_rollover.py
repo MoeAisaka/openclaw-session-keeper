@@ -118,6 +118,386 @@ class RolloverTests(unittest.TestCase):
             manager = self.make_manager(Path(value))
             self.assertFalse(manager._is_idle({"status": "running", "updatedAt": 0}))
 
+    def test_gateway_reset_is_always_non_interrupting(self):
+        with tempfile.TemporaryDirectory() as value:
+            manager = self.make_manager(Path(value))
+            with patch.object(manager, "_gateway_call", return_value={"ok": True}) as call:
+                manager._gateway_reset("agent:main:project-test")
+            call.assert_called_once_with("sessions.reset", {
+                "key": "agent:main:project-test",
+                "reason": "reset",
+                "interruptActiveWork": False,
+            })
+
+    def test_rollover_threshold_arms_handoff_without_reset(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["rolloverTiming"] = {"deferUntilNextUserMessage": True}
+            manager.config["thresholds"]["minIdleSeconds"] = 0
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "message", "message": {"role": "assistant", "content": "final answer"}}),
+                encoding="utf-8",
+            )
+            entry = {
+                "sessionId": "old-session",
+                "sessionFile": str(transcript),
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": entry,
+            }), encoding="utf-8")
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            handoff = {"handoffPath": str(handoff_path), "continuityContext": "verified"}
+            with patch.object(manager, "_handoff", return_value=handoff), patch.object(
+                manager, "_gateway_reset"
+            ) as gateway_reset:
+                payload = manager.scan()
+            gateway_reset.assert_not_called()
+            self.assertEqual(payload["results"][0]["action"], "rollover_deferred")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "pending_next_user")
+            self.assertEqual(current["oldSessionId"], "old-session")
+
+            with patch.object(manager, "_handoff") as handoff_again:
+                payload = manager.scan()
+            handoff_again.assert_not_called()
+            self.assertEqual(payload["results"][0]["action"], "rollover_awaiting_agent_run")
+
+    def test_pending_rollover_activates_from_stored_handoff(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            old_entry = {
+                "sessionId": "old-session",
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            sessions_path = root / "sessions.json"
+            sessions_path.write_text(json.dumps({
+                "agent:main:project-test": old_entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "pending_next_user",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "label": "测试",
+                "project": "test",
+                "tokens": 270000,
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+                "continuityContext": "verified",
+            })
+
+            def gateway_reset(_session_key):
+                new_entry = {**old_entry, "sessionId": "new-session", "totalTokens": 0}
+                sessions_path.write_text(json.dumps({
+                    "agent:main:project-test": new_entry,
+                }), encoding="utf-8")
+                return {"ok": True, "key": "agent:main:project-test", "entry": new_entry}
+
+            with patch.object(manager, "_gateway_reset", side_effect=gateway_reset):
+                result = manager.activate_pending("agent:main:project-test")
+            self.assertEqual(result["action"], "pending_rollover_activated")
+            self.assertEqual(result["oldSessionId"], "old-session")
+            self.assertEqual(result["newSessionId"], "new-session")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "active")
+            self.assertEqual(current["activationTrigger"], "next_user_message")
+            self.assertEqual(current["resetSafety"]["mode"], "reject_if_active")
+            self.assertNotIn("firstDispatch", current)
+
+    def test_pending_rollover_marks_boundary_run_without_resetting_it(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": {
+                    "sessionId": "old-session",
+                    "status": "running",
+                    "updatedAt": 0,
+                },
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "pending_next_user",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+            })
+            with patch.object(manager, "_gateway_reset") as gateway_reset:
+                result = manager.record_first_dispatch_start(
+                    "agent:main:project-test",
+                    "run-1",
+                    "old-session",
+                )
+            gateway_reset.assert_not_called()
+            self.assertEqual(result["action"], "deferred_rollover_run_started")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "draining_current_run")
+            self.assertEqual(current["drainRun"]["runId"], "run-1")
+
+    def test_scan_waits_while_the_boundary_run_is_active(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": {
+                    "sessionId": "old-session",
+                    "totalTokens": 270000,
+                    "status": "running",
+                    "updatedAt": 0,
+                    "label": "测试",
+                    "thinkingLevel": "xhigh",
+                    "fastMode": False,
+                },
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "draining_current_run",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+                "drainRun": {"runId": "run-1", "startedAt": MODULE.now_iso()},
+            })
+            with patch.object(manager, "_gateway_reset") as gateway_reset:
+                result = manager.scan()
+            gateway_reset.assert_not_called()
+            self.assertEqual(result["results"][0]["action"], "rollover_run_draining")
+
+    def test_scan_rotates_after_the_boundary_run_is_idle_with_a_fresh_handoff(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["rolloverTiming"] = {"deferUntilNextUserMessage": True}
+            manager.config["thresholds"]["minIdleSeconds"] = 0
+            old_handoff_path = root / "old-handoff.json"
+            old_handoff_path.write_text("{}\n", encoding="utf-8")
+            fresh_handoff_path = root / "fresh-handoff.json"
+            fresh_handoff_path.write_text("{}\n", encoding="utf-8")
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "message", "message": {"role": "assistant", "content": "latest result"}}),
+                encoding="utf-8",
+            )
+            old_entry = {
+                "sessionId": "old-session",
+                "sessionFile": str(transcript),
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            sessions_path = root / "sessions.json"
+            sessions_path.write_text(json.dumps({"agent:main:project-test": old_entry}), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "ready_after_run",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "handoffPath": str(old_handoff_path),
+                "handoffSha256": MODULE.sha256_file(old_handoff_path),
+                "drainRun": {
+                    "runId": "run-1",
+                    "status": "completed",
+                    "finishedAt": MODULE.now_iso(),
+                },
+            })
+
+            def gateway_reset(_session_key):
+                new_entry = {**old_entry, "sessionId": "new-session", "totalTokens": 0}
+                sessions_path.write_text(json.dumps({"agent:main:project-test": new_entry}), encoding="utf-8")
+                return {"ok": True, "key": "agent:main:project-test", "entry": new_entry}
+
+            fresh_handoff = {
+                "handoffPath": str(fresh_handoff_path),
+                "continuityContext": "latest result preserved",
+            }
+            with patch.object(manager, "_handoff", return_value=fresh_handoff) as handoff, patch.object(
+                manager, "_gateway_reset", side_effect=gateway_reset
+            ):
+                payload = manager.scan()
+            handoff.assert_called_once()
+            self.assertEqual(payload["results"][0]["trigger"], "post_run_idle")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["handoffPath"], str(fresh_handoff_path))
+            self.assertEqual(current["resetSafety"]["mode"], "reject_if_active")
+
+    def test_raced_reset_rejection_restores_ready_state_for_retry(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["thresholds"]["minIdleSeconds"] = 0
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "message", "message": {"role": "assistant", "content": "done"}}),
+                encoding="utf-8",
+            )
+            entry = {
+                "sessionId": "old-session",
+                "sessionFile": str(transcript),
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "ready_after_run",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "drainRun": {"runId": "run-1", "status": "completed"},
+            })
+            handoff_path = root / "fresh-handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            handoff = {
+                "handoffPath": str(handoff_path),
+                "continuityContext": "verified",
+            }
+            with patch.object(manager, "_handoff", return_value=handoff), patch.object(
+                manager,
+                "_gateway_reset",
+                side_effect=RuntimeError("Session is still active; try again in a moment."),
+            ):
+                result = manager._rollover_unlocked(
+                    "agent:main:project-test",
+                    force=True,
+                    trigger_override="post_run_idle",
+                )
+            self.assertEqual(result["action"], "reset_rejected_active")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "ready_after_run")
+            self.assertEqual(current["lastResetAttempt"]["status"], "rejected_active")
+
+    def test_activate_pending_refuses_to_reset_a_running_generation(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            old_entry = {
+                "sessionId": "old-session",
+                "totalTokens": 270000,
+                "status": "running",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": old_entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "pending_next_user",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "label": "测试",
+                "project": "test",
+                "tokens": 270000,
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+                "continuityContext": "verified",
+            })
+            with patch.object(manager, "_gateway_reset") as gateway_reset:
+                result = manager.activate_pending("agent:main:project-test")
+            gateway_reset.assert_not_called()
+            self.assertEqual(result["action"], "pending_busy")
+
+    def test_activate_pending_is_idempotent_when_nothing_is_armed(self):
+        with tempfile.TemporaryDirectory() as value:
+            manager = self.make_manager(Path(value))
+            self.assertEqual(
+                manager.activate_pending("agent:main:project-test")["action"],
+                "no_pending_rollover",
+            )
+
+    def test_prepared_rollover_reconciles_before_retry_dispatch(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            new_entry = {
+                "sessionId": "new-session",
+                "totalTokens": 0,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": new_entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "prepared",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "label": "测试",
+                "project": "test",
+                "tokens": 270000,
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+                "continuityContext": "verified",
+            })
+            result = manager.activate_pending("agent:main:project-test")
+            self.assertEqual(result["action"], "pending_rollover_reconciled")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "active")
+            self.assertEqual(current["newSessionId"], "new-session")
+
+    def test_emergency_threshold_still_rolls_over_immediately(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["rolloverTiming"] = {"deferUntilNextUserMessage": True}
+            manager.config["thresholds"]["minIdleSeconds"] = 0
+            (root / "sessions.json").write_text(json.dumps({
+                "agent:main:project-test": {
+                    "sessionId": "old-session",
+                    "totalTokens": 320000,
+                    "status": "done",
+                    "updatedAt": 0,
+                    "thinkingLevel": "xhigh",
+                    "fastMode": False,
+                }
+            }), encoding="utf-8")
+            with patch.object(
+                manager,
+                "_rollover_unlocked",
+                return_value={"sessionKey": "agent:main:project-test", "action": "immediate"},
+            ) as rollover:
+                payload = manager.scan()
+            rollover.assert_called_once_with(
+                "agent:main:project-test",
+                force=False,
+                dry_run=False,
+                trigger_override="emergency_token_limit",
+            )
+            self.assertEqual(payload["results"][0]["action"], "immediate")
+
     def test_codex_binding_key_matches_openclaw(self):
         self.assertEqual(
             MODULE.codex_binding_store_key("agent:main:project-example"),
@@ -296,7 +676,11 @@ class RolloverTests(unittest.TestCase):
             "sessionKey": "agent:main:project-test",
             "oldSessionId": "old-session",
             "handoffPath": "/tmp/handoff.json",
-            "recentMessages": [{"role": "user", "text": "secret-value"}],
+            "recentMessages": [
+                {"role": "user", "text": "secret-value"},
+                {"role": "assistant", "text": "最终结论：任务已完成"},
+            ],
+            "workflowTasks": [],
         }
         notice = MODULE.render_visible_continuity_notice(handoff, "new-session")
         self.assertIn("会话已安全换代", notice)
@@ -305,6 +689,8 @@ class RolloverTests(unittest.TestCase):
         self.assertIn("/tmp/handoff.json", notice)
         self.assertIn(MODULE.continuity_notice_marker("old-session", "new-session"), notice)
         self.assertNotIn("secret-value", notice)
+        self.assertIn("最终结论：任务已完成", notice)
+        self.assertIn("自动续跑：否", notice)
 
     def test_visible_notice_uses_chat_inject_and_reads_marker_back(self):
         with tempfile.TemporaryDirectory() as value:
@@ -433,7 +819,7 @@ class RolloverTests(unittest.TestCase):
             self.assertEqual(result["status"], "pending_busy")
             self.assertEqual(gateway.call_count, 1)
 
-    def test_reconcile_keeps_prepared_state_when_visible_notice_fails(self):
+    def test_reconcile_activates_generation_when_only_visible_notice_fails(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             manager = self.make_manager(root)
@@ -467,8 +853,11 @@ class RolloverTests(unittest.TestCase):
             self.assertEqual(recovered[0]["event"], "visibility_notice_retry_failed")
             current = MODULE.read_json(manager.current_path, {})
             record = current["sessions"]["agent:main:project-test"]
-            self.assertEqual(record["status"], "prepared")
+            self.assertEqual(record["status"], "active")
             self.assertEqual(record["visibilityNotice"]["status"], "pending_retry")
+            self.assertEqual(record["resetSafety"]["mode"], "unknown_legacy")
+            self.assertFalse(record["resetSafety"]["verified"])
+            self.assertNotIn("firstDispatch", record)
 
     def test_scan_auto_repairs_allowlisted_existing_rollover_once(self):
         with tempfile.TemporaryDirectory() as value:
@@ -516,6 +905,69 @@ class RolloverTests(unittest.TestCase):
             ensure_again.assert_not_called()
             self.assertEqual(payload["visibilityRepairs"][0]["status"], "already_verified")
 
+    def test_failed_first_dispatch_repairs_previous_outcome_notice(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["visibleContinuity"] = {"enabled": True}
+            manager._update_current("agent:main:project-test", {
+                "status": "active",
+                "oldSessionId": "old-session",
+                "newSessionId": "new-session",
+                "handoffPath": "/tmp/handoff.json",
+                "visibilityNotice": {"status": "deferred_until_first_dispatch_complete"},
+                "firstDispatch": {
+                    "status": "failed",
+                    "runId": "run-1",
+                    "armedAt": MODULE.now_iso(),
+                },
+            })
+            verified = {
+                "status": "verified",
+                "verification": "injected_and_read_back",
+                "marker": "marker",
+            }
+            with patch.object(
+                manager, "_ensure_visible_continuity", return_value=verified
+            ) as ensure:
+                results = manager._repair_deferred_visibility_notices(dry_run=False)
+            ensure.assert_called_once()
+            self.assertEqual(results[0]["status"], "verified")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["visibilityNotice"], verified)
+            self.assertEqual(
+                current["firstDispatch"]["continuityNoticeVerifiedAt"][:10],
+                MODULE.now_iso()[:10],
+            )
+
+    def test_verified_notice_does_not_hide_a_first_dispatch_start_timeout(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["visibleContinuity"] = {
+                "enabled": True,
+                "firstDispatchStartTimeoutSeconds": 30,
+            }
+            manager._update_current("agent:main:project-test", {
+                "status": "active",
+                "oldSessionId": "old-session",
+                "newSessionId": "new-session",
+                "visibilityNotice": {
+                    "status": "verified",
+                    "verification": "injected_and_read_back",
+                },
+                "firstDispatch": {
+                    "status": "awaiting_agent_start",
+                    "armedAt": "2026-07-19T00:00:00+00:00",
+                },
+            })
+            with patch.object(manager, "_ensure_visible_continuity") as ensure:
+                results = manager._repair_deferred_visibility_notices(dry_run=False)
+            ensure.assert_not_called()
+            self.assertEqual(results[0]["status"], "start_timeout")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["firstDispatch"]["status"], "start_timeout")
+
     def test_manual_visibility_repair_live_path_returns_event(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -554,11 +1006,77 @@ class RolloverTests(unittest.TestCase):
             "workflowTasks": [],
             "memories": [],
             "paths": [],
-            "recentMessages": [{"role": "user", "text": "x" * 5000}],
+            "recentMessages": [
+                {"role": "user", "text": "x" * 5000},
+                {"role": "assistant", "text": "FINAL-SENTINEL-RESULT" + ("y" * 5000)},
+            ],
         }
         context = MODULE.render_continuity_context(handoff, 1000)
         self.assertLessEqual(len(context), 1000)
         self.assertIn("handoff_file", context)
+        self.assertIn("FINAL-SENTINEL-RESULT", context)
+
+    def test_continuation_decision_uses_ledger_before_free_form_turn_order(self):
+        replied = [{"role": "assistant", "text": "已完成"}]
+        idle = MODULE.continuation_decision(replied, [])
+        self.assertEqual(idle["action"], "await_current_user_request")
+        self.assertFalse(idle["shouldAutoContinue"])
+
+        active = MODULE.continuation_decision(replied, [{
+            "task_id": "task-1",
+            "status": "in_progress",
+        }])
+        self.assertEqual(active["action"], "resume_registered_work")
+        self.assertTrue(active["shouldAutoContinue"])
+
+        blocked = MODULE.continuation_decision(replied, [{
+            "task_id": "task-2",
+            "status": "blocked",
+        }])
+        self.assertEqual(blocked["action"], "report_registered_blocker")
+        self.assertFalse(blocked["shouldAutoContinue"])
+
+    def test_deferred_rollover_run_start_and_end_are_idempotent(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager._update_current("agent:main:project-test", {
+                "status": "pending_next_user",
+                "oldSessionId": "old-session",
+            })
+            started = manager.record_first_dispatch_start(
+                "agent:main:project-test",
+                "run-1",
+                "old-session",
+            )
+            self.assertEqual(started["action"], "deferred_rollover_run_started")
+            duplicate_start = manager.record_first_dispatch_start(
+                "agent:main:project-test",
+                "run-1",
+                "old-session",
+            )
+            self.assertEqual(
+                duplicate_start["action"],
+                "deferred_rollover_run_start_idempotent",
+            )
+            finished = manager.record_first_dispatch_end(
+                "agent:main:project-test",
+                "run-1",
+                success=True,
+            )
+            self.assertEqual(finished["action"], "deferred_rollover_run_completed")
+            duplicate_end = manager.record_first_dispatch_end(
+                "agent:main:project-test",
+                "run-1",
+                success=True,
+            )
+            self.assertEqual(
+                duplicate_end["action"],
+                "deferred_rollover_run_end_idempotent",
+            )
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "ready_after_run")
+            self.assertEqual(current["drainRun"]["status"], "completed")
 
     def test_dry_run_checkpoint_does_not_create_state(self):
         with tempfile.TemporaryDirectory() as value:

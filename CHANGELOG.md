@@ -4,6 +4,58 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-19
+
+### Fixed
+
+- Remove rollover from `before_dispatch`, which OpenClaw invokes only after the task has already acquired a work-admission lease.
+- Mark the first real post-threshold run in `before_agent_run`, explicitly return `outcome: pass`, and let the run finish on its original generation before `agent_end` marks the rollover ready.
+- Let the idle scanner build a fresh handoff containing the completed result and rotate only after the boundary run has released.
+- Call the version-gated OpenClaw reset extension with `interruptActiveWork=false`; the core lifecycle lock now rejects a raced reset instead of aborting admitted work.
+- Record `first_dispatch` start timeouts even when the continuity notice was already verified, preventing stale `awaiting_agent_start` records from remaining permanently green.
+
+### Security
+
+- Never persist, log, reject, or replay the boundary-run prompt. Only lifecycle identifiers and success state enter rollover state.
+
+## [0.3.2] - 2026-07-19
+
+### Fixed
+
+- Ignore empty or whitespace-only `before_dispatch` events while a normal rollover is pending, so reconnect, startup, or view-only traffic cannot rotate the physical session before a real user task arrives.
+- Inspect dispatch content only for an in-memory nonempty check; never log or persist the content.
+
+## [0.3.1] - 2026-07-19
+
+### Fixed
+
+- Preserve a bounded copy of the previous assistant outcome in the verified handoff and operator-visible rollover notice.
+- Derive an explicit continuation decision from Workflow Ledger state and visible turn order, so a completed turn is not silently rerun.
+- Treat a busy visibility notice after a committed reset as auxiliary instead of failing the triggering user dispatch.
+
+### Added
+
+- Track the first new-generation Agent run through `before_agent_run` and `agent_end` without persisting prompts, replies, or raw errors.
+- Record idempotent `first_dispatch_started`, `first_dispatch_completed`, and `first_dispatch_failed` lifecycle evidence.
+- Reconcile a failed or never-started first dispatch by injecting the preserved outcome after the session becomes idle.
+
+## [0.3.0] - 2026-07-18
+
+### Added
+
+- Add an opt-in deferred rollover state machine: the periodic scanner prepares a checksummed handoff at the normal threshold, while the awaited `before_dispatch` hook activates the rollover before the next user task is dispatched.
+- Add the idempotent `activate-pending` operator command and deterministic coverage for arming, activation, retry and emergency paths.
+
+### Changed
+
+- Preserve the just-finished assistant answer in the current physical session until the next user message arrives.
+- Keep emergency thresholds and retired Codex-binding recovery immediate and fail closed.
+
+### Security
+
+- Never log or persist the inbound prompt in the deferred rollover hook.
+- Fail closed before agent execution when a pending rollover cannot be verified or activated, so retrying cannot duplicate a partially executed task.
+
 ## [0.2.2] - 2026-07-16
 
 ### Fixed

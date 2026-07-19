@@ -4,7 +4,7 @@ Safe physical-session rollover behind stable OpenClaw project session keys.
 
 Long-running agent sessions eventually become expensive, brittle, or difficult to recover. Session Keeper creates a verified handoff, rotates the physical session only while it is idle, and keeps the stable project entry intact.
 
-Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
+Version 0.3.3 defers normal physical rollover until one real post-threshold Agent run has completed. `before_agent_run` records the boundary run and always passes it; `agent_end` marks the rollover ready; the idle scanner then builds a fresh handoff and requests an atomic reject-if-active reset. Startup, reconnect and view-only traffic cannot rotate the session because they do not start an Agent run. Emergency rollover remains immediate but uses the same non-interrupting core reset. Version 0.2 also provides an auth-independent deterministic compaction provider for compatible embedded runtimes and keeps emergency recovery inside OpenClaw's Gateway lifecycle lock. Native hosted-Codex sessions require the compatibility policy below because OpenClaw `2026.7.1` owns their compaction lifecycle.
 
 ## Measured cost model
 
@@ -31,6 +31,7 @@ formulas, caveats, and official pricing sources.
 - User-selected provider/model overrides
 - Thinking preferences and, when explicitly enabled, the user's current Standard/Fast choice
 - An idempotent, operator-visible rollover notice
+- Optional deferred normal rollover after the next real Agent run completes
 
 ## Safety model
 
@@ -41,11 +42,14 @@ formulas, caveats, and official pricing sources.
 - The optional Codex binding check opens the configured SQLite database read-only.
 - Deterministic compaction uses bounded one-pass retention instead of copying the full normalized transcript.
 - Emergency recovery backs up first, then calls the official `sessions.compact --max-lines` Gateway RPC. It never rewrites an active transcript or `sessions.json` directly.
+- Deferred lifecycle tracking never blocks, rejects, logs or persists the inbound prompt.
+- Physical reset uses `interruptActiveWork=false`; the OpenClaw lifecycle lock rejects a raced reset instead of aborting admitted work.
 
 ## Requirements
 
 - Python 3.10+
 - OpenClaw with `gateway call sessions.reset`, `sessions.patch`, `chat.history`, and `chat.inject`
+- The version-gated non-interrupting reset extension documented in the production deployment notes; without it Keeper fails closed and will not rotate
 - macOS or Linux with `fcntl`
 - Optional: nmem for semantic recall
 - Optional: Codex app-server state inspection
@@ -116,10 +120,27 @@ session value across scans and physical rollover instead of forcing the default
 back onto an explicit user choice. Keep the option disabled for unattended or
 role-agent sessions that must always run in Standard mode.
 
+`rolloverTiming.deferUntilNextUserMessage` is also opt-in. When enabled, the
+scanner arms normal threshold rollovers without changing the current physical
+session. The next real `before_agent_run` marks the admitted task as the
+boundary run and explicitly lets it proceed on the original generation.
+`agent_end` records completion, and the periodic scanner waits for idle before
+building a fresh handoff and requesting an atomic reject-if-active reset.
+Concurrent or queued tasks continue normally; if one races the reset, the core
+rejects that reset and the scanner retries later. The hooks never inspect,
+persist or replay the prompt. The handoff carries a bounded previous
+assistant outcome plus an explicit continuation decision derived from Workflow
+Ledger state and visible turn order. Emergency thresholds and retired
+Codex-binding recovery remain immediate but use the same non-interrupting
+reset contract. The hooks must
+point to this repository's manager script, production configuration and state
+file through the plugin's `deferredRollover` settings.
+
 Run a real scan only after the dry run is clean:
 
 ```bash
 python3 session_rollover.py scan
+python3 session_rollover.py activate-pending --session-key agent:main:project-example
 python3 session_rollover.py status
 ```
 
@@ -129,6 +150,7 @@ python3 session_rollover.py status
 python3 session_rollover.py scan --dry-run
 python3 session_rollover.py scan
 python3 session_rollover.py rollover --session-key agent:main:project-example --dry-run
+python3 session_rollover.py activate-pending --session-key agent:main:project-example --dry-run
 python3 session_rollover.py repair-visibility --session-key agent:main:project-example --dry-run
 python3 session_rollover.py status
 
