@@ -18,7 +18,21 @@
     "agentId": {"type": "string", "minLength": 1},
     "nmemBin": {"type": "string", "minLength": 1},
     "sessionPreferences": {"type": "object"},
-    "visibleContinuity": {"type": "object"},
+    "visibleContinuity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "label": {"type": "string", "minLength": 1, "maxLength": 100},
+        "historyCheckLimit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "lastAssistantOutcomeChars": {"type": "integer", "minimum": 500, "maximum": 20000},
+        "firstDispatchStartTimeoutSeconds": {"type": "integer", "minimum": 30, "maximum": 3600},
+        "repairExistingSessionKeys": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
     "rolloverTiming": {
       "type": "object",
       "additionalProperties": false,

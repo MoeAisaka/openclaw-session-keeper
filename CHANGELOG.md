@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-19
+
+### Fixed
+
+- Preserve a bounded copy of the previous assistant outcome in the verified handoff and operator-visible rollover notice.
+- Derive an explicit continuation decision from Workflow Ledger state and visible turn order, so a completed turn is not silently rerun.
+- Treat a busy visibility notice after a committed reset as auxiliary instead of failing the triggering user dispatch.
+
+### Added
+
+- Track the first new-generation Agent run through `before_agent_run` and `agent_end` without persisting prompts, replies, or raw errors.
+- Record idempotent `first_dispatch_started`, `first_dispatch_completed`, and `first_dispatch_failed` lifecycle evidence.
+- Reconcile a failed or never-started first dispatch by injecting the preserved outcome after the session becomes idle.
+
 ## [0.3.0] - 2026-07-18
 
 ### Added

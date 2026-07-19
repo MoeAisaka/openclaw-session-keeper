@@ -30,7 +30,7 @@ DEFAULT_CONFIG = Path(
         Path.home() / ".config" / "openclaw-session-keeper" / "config.json",
     )
 ).expanduser()
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 ACTIVE_TASK_STATUSES = {"planned", "in_progress", "waiting", "blocked"}
 IDLE_STATUSES = {None, "", "done", "idle", "killed", "failed", "timed_out", "cancelled"}
 PATH_RE = re.compile(
@@ -42,6 +42,8 @@ DEFAULT_VISIBLE_CONTINUITY = {
     "enabled": False,
     "label": "会话换代",
     "historyCheckLimit": 200,
+    "lastAssistantOutcomeChars": 6000,
+    "firstDispatchStartTimeoutSeconds": 180,
     "repairExistingSessionKeys": [],
 }
 DEFAULT_ROLLOVER_TIMING = {
@@ -57,6 +59,16 @@ def ensure_private_dir(path: Path) -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def iso_age_seconds(value: Any) -> float | None:
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - timestamp).total_seconds())
+    except (TypeError, ValueError):
+        return None
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -148,6 +160,79 @@ def content_to_text(content: Any) -> str:
     return ""
 
 
+def bounded_excerpt(value: str, limit: int) -> str:
+    """Keep both the conclusion lead and trailing evidence within a hard bound."""
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    if limit <= 80:
+        return text[:limit]
+    marker = "\n…[内容已按交接上限截断]…\n"
+    remaining = max(0, limit - len(marker))
+    head = max(1, remaining * 2 // 3)
+    tail = max(0, remaining - head)
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+def continuation_decision(
+    messages: list[dict[str, str]],
+    tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive a deterministic resume directive without interpreting free-form prose."""
+    last_role = messages[-1]["role"] if messages else None
+    resumable = [
+        task for task in tasks
+        if task.get("status") in {"planned", "in_progress"}
+    ]
+    paused = [
+        task for task in tasks
+        if task.get("status") in {"waiting", "blocked"}
+    ]
+    if resumable:
+        action = "resume_registered_work"
+        reason = "registered_resumable_workflow_exists"
+        should_auto_continue = True
+    elif paused:
+        action = "report_registered_blocker"
+        reason = "registered_workflow_is_waiting_or_blocked"
+        should_auto_continue = False
+    elif last_role == "user":
+        action = "respond_to_pending_user"
+        reason = "old_generation_ended_with_unanswered_user_message"
+        should_auto_continue = True
+    elif last_role == "assistant":
+        action = "await_current_user_request"
+        reason = "previous_turn_replied_and_no_active_workflow"
+        should_auto_continue = False
+    else:
+        action = "manual_review_required"
+        reason = "no_visible_turn_state"
+        should_auto_continue = False
+    return {
+        "schemaVersion": 1,
+        "previousTurnState": (
+            "assistant_replied" if last_role == "assistant"
+            else "user_message_unanswered" if last_role == "user"
+            else "unknown"
+        ),
+        "lastVisibleRole": last_role,
+        "activeWorkflowTaskCount": len(tasks),
+        "resumableWorkflowTaskIds": [task.get("task_id") for task in resumable],
+        "pausedWorkflowTaskIds": [task.get("task_id") for task in paused],
+        "action": action,
+        "shouldAutoContinue": should_auto_continue,
+        "reason": reason,
+        "sourceOfTruth": "workflow_ledger_then_visible_turn_order",
+    }
+
+
+def last_assistant_outcome(messages: list[dict[str, str]], limit: int) -> str | None:
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and message.get("text", "").strip():
+            return bounded_excerpt(message["text"], limit)
+    return None
+
+
 def continuity_notice_marker(old_session_id: str, new_session_id: str) -> str:
     """Stable marker used to make chat.inject retries idempotent."""
     return (
@@ -159,25 +244,47 @@ def continuity_notice_marker(old_session_id: str, new_session_id: str) -> str:
 def render_visible_continuity_notice(
     handoff: dict[str, Any],
     new_session_id: str,
+    outcome_char_limit: int = 6000,
 ) -> str:
-    """Render a bounded operator-visible notice without replaying private history."""
+    """Render the previous outcome and deterministic continuation decision."""
     old_session_id = str(handoff["oldSessionId"])
     marker = continuity_notice_marker(old_session_id, new_session_id)
-    return "\n".join([
-        "会话已安全换代，项目上下文已恢复。",
+    decision = handoff.get("continuationDecision")
+    if not isinstance(decision, dict):
+        decision = continuation_decision(
+            handoff.get("recentMessages", []),
+            handoff.get("workflowTasks", []),
+        )
+    previous_turn = {
+        "assistant_replied": "已产出最终答复",
+        "user_message_unanswered": "存在未答复的用户消息",
+    }.get(decision.get("previousTurnState"), "无法确定")
+    auto_continue = "是" if decision.get("shouldAutoContinue") else "否"
+    lines = [
+        "会话已安全换代；上一轮结果与续跑决策已恢复。",
         "",
         f"- 项目：{handoff['label']}",
         f"- 稳定入口：`{handoff['sessionKey']}`",
         f"- 上一代会话：`{old_session_id}`",
         f"- 当前会话：`{new_session_id}`",
         "- 旧历史：完整归档，未删除",
+        f"- 上一轮执行：{previous_turn}",
+        f"- 登记中的活动工作流：{decision.get('activeWorkflowTaskCount', 0)}",
+        f"- 自动续跑：{auto_continue}（`{decision.get('action')}`）",
         f"- 交接记录：`{handoff['handoffPath']}`",
-        "- 恢复状态：已验证，可直接继续工作",
         "",
-        "WebChat 当前按物理会话显示历史，暂不会自动拼接上一代。"
-        "如需追溯，可让我读取上述交接记录。",
+    ]
+    outcome = last_assistant_outcome(
+        handoff.get("recentMessages", []),
+        outcome_char_limit,
+    )
+    if outcome:
+        lines.extend(["上一轮最终答复（原文节选）：", "", outcome, ""])
+    lines.extend([
+        "说明：换代校验成功不等于新会话任务已执行；首个新会话任务会单独记录开始与结束状态。",
         marker,
     ])
+    return "\n".join(lines)
 
 
 def recent_visible_messages(path: Path, count: int, char_limit: int) -> list[dict[str, str]]:
@@ -297,7 +404,13 @@ def referenced_paths(messages: list[dict[str, str]], tasks: list[dict[str, Any]]
 
 
 def render_continuity_context(handoff: dict[str, Any], char_limit: int) -> str:
-    lines = [
+    decision = handoff.get("continuationDecision")
+    if not isinstance(decision, dict):
+        decision = continuation_decision(
+            handoff.get("recentMessages", []),
+            handoff.get("workflowTasks", []),
+        )
+    required = [
         "[PROJECT_SESSION_CONTINUITY]",
         f"project={handoff['project']}",
         f"label={handoff['label']}",
@@ -305,39 +418,69 @@ def render_continuity_context(handoff: dict[str, Any], char_limit: int) -> str:
         f"previous_session_id={handoff['oldSessionId']}",
         f"handoff_file={handoff['handoffPath']}",
         "This is a verified rollover handoff. Treat files and external state as source of truth; re-check them before mutation.",
+        f"previous_turn_state={decision.get('previousTurnState')}",
+        f"continuation_action={decision.get('action')}",
+        f"should_auto_continue={str(bool(decision.get('shouldAutoContinue'))).lower()}",
+        f"continuation_reason={decision.get('reason')}",
+        "When the user asks for progress or status, surface the preserved last assistant outcome first.",
+        "Do not silently rerun completed work. Auto-continue only when should_auto_continue=true and the registered workflow state supports it.",
     ]
     desired_preferences = handoff.get("sessionPreferences", {}).get("desired", {})
     if desired_preferences:
-        lines.append(
+        required.append(
             "session_preferences="
             f"thinkingLevel:{desired_preferences.get('thinkingLevel')},"
             f"fastMode:{desired_preferences.get('fastMode')}"
         )
+    blocks: list[str] = []
     if handoff.get("workflowTasks"):
-        lines.append("Active workflow tasks:")
+        task_lines = ["Active workflow tasks:"]
         for task in handoff["workflowTasks"]:
-            lines.append(
+            task_lines.append(
                 f"- {task.get('task_id')}: {task.get('status')} | current={task.get('current_step') or '-'} | next={task.get('next_step') or '-'}"
             )
-    if handoff.get("memories"):
-        lines.append("Relevant durable memories:")
-        for memory in handoff["memories"]:
-            lines.append(f"- {memory.get('id')}: {memory.get('title')}")
-    if handoff.get("paths"):
-        lines.append("Referenced artifacts:")
-        for item in handoff["paths"][:20]:
-            lines.append(f"- {item.get('path')} | exists={item.get('exists')}")
+        blocks.append("\n".join(task_lines))
+    outcome = last_assistant_outcome(
+        handoff.get("recentMessages", []),
+        min(6000, max(800, char_limit // 2)),
+    )
+    if outcome:
+        blocks.append("Last assistant outcome (verbatim, bounded):\n" + outcome)
     if handoff.get("recentMessages"):
-        lines.append("Recent visible conversation (verbatim, bounded):")
-        for message in handoff["recentMessages"]:
+        recent_lines = ["Recent visible conversation (verbatim, newest state preserved):"]
+        for message in handoff["recentMessages"][-6:]:
             role = "USER" if message["role"] == "user" else "ASSISTANT"
-            lines.append(f"{role}: {message['text']}")
-    lines.append("[/PROJECT_SESSION_CONTINUITY]")
-    value = "\n".join(lines)
-    if len(value) <= char_limit:
-        return value
-    head = value[: max(0, char_limit - 160)]
-    return head + "\n[continuity context truncated; read handoff_file for full verified state]\n[/PROJECT_SESSION_CONTINUITY]"
+            recent_lines.append(f"{role}: {bounded_excerpt(message['text'], 2400)}")
+        blocks.append("\n".join(recent_lines))
+    if handoff.get("memories"):
+        memory_lines = ["Relevant durable memories:"]
+        for memory in handoff["memories"]:
+            memory_lines.append(f"- {memory.get('id')}: {memory.get('title')}")
+        blocks.append("\n".join(memory_lines))
+    if handoff.get("paths"):
+        path_lines = ["Referenced artifacts:"]
+        for item in handoff["paths"][:20]:
+            path_lines.append(f"- {item.get('path')} | exists={item.get('exists')}")
+        blocks.append("\n".join(path_lines))
+
+    closing = "[/PROJECT_SESSION_CONTINUITY]"
+    truncation = "[additional continuity context omitted; read handoff_file for full verified state]"
+    value = "\n".join(required)
+    budget = max(0, char_limit - len(closing) - 1)
+    value = value[:budget]
+    for block in blocks:
+        separator = "\n" if not value else "\n"
+        available = budget - len(value) - len(separator)
+        if available <= 0:
+            break
+        if len(block) <= available:
+            value += separator + block
+            continue
+        if available > len(truncation) + 80:
+            excerpt_limit = available - len(truncation) - 1
+            value += separator + bounded_excerpt(block, excerpt_limit) + "\n" + truncation
+        break
+    return value + "\n" + closing
 
 
 class RolloverManager:
@@ -566,6 +709,12 @@ class RolloverManager:
             isinstance(item, str) and item.strip() for item in repair_keys
         ):
             raise RuntimeError("visible_continuity_repair_keys_invalid")
+        outcome_limit = merged.get("lastAssistantOutcomeChars")
+        if not isinstance(outcome_limit, int) or not 500 <= outcome_limit <= 20000:
+            raise RuntimeError("visible_continuity_outcome_limit_invalid")
+        start_timeout = merged.get("firstDispatchStartTimeoutSeconds")
+        if not isinstance(start_timeout, int) or not 30 <= start_timeout <= 3600:
+            raise RuntimeError("visible_continuity_start_timeout_invalid")
         return merged
 
     def _rollover_timing_config(self) -> dict[str, Any]:
@@ -642,7 +791,11 @@ class RolloverManager:
                 "marker": marker,
                 "sessionStatus": entry.get("status"),
             }
-        message = render_visible_continuity_notice(handoff, new_session_id)
+        message = render_visible_continuity_notice(
+            handoff,
+            new_session_id,
+            int(config["lastAssistantOutcomeChars"]),
+        )
         if dry_run:
             return {
                 "status": "would_inject",
@@ -729,7 +882,7 @@ class RolloverManager:
         archive_dir = self.state_root / "handoffs" / session_slug(session_key) / f"{timestamp}-{entry['sessionId']}-{uuid.uuid4().hex[:8]}"
         handoff_path = archive_dir / "handoff.json"
         handoff = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "createdAt": now_iso(),
             "sessionKey": session_key,
             "oldSessionId": entry["sessionId"],
@@ -759,6 +912,7 @@ class RolloverManager:
             "paths": [],
             "handoffPath": str(handoff_path),
         }
+        handoff["continuationDecision"] = continuation_decision(recent, tasks)
         handoff["paths"] = referenced_paths(recent, tasks)
         handoff["continuityContext"] = render_continuity_context(
             handoff, int(thresholds["continuityContextChars"])
@@ -794,6 +948,10 @@ class RolloverManager:
         verification: str = "verified",
         visibility_notice: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        handoff = read_json(Path(str(prepared.get("handoffPath") or "")), {})
+        decision = handoff.get("continuationDecision") if isinstance(handoff, dict) else {}
+        if not isinstance(decision, dict):
+            decision = {}
         return {
             **prepared,
             "status": "active",
@@ -802,6 +960,13 @@ class RolloverManager:
             "activatedAt": now_iso(),
             "verification": verification,
             "visibilityNotice": visibility_notice or {"status": "disabled"},
+            "firstDispatch": {
+                "status": "awaiting_agent_start",
+                "newSessionId": new_session_id,
+                "continuationAction": decision.get("action", "manual_review_required"),
+                "shouldAutoContinue": bool(decision.get("shouldAutoContinue", False)),
+                "armedAt": now_iso(),
+            },
             "gatewayResponse": {
                 "ok": (response or {}).get("ok"),
                 "key": (response or {}).get("key"),
@@ -967,18 +1132,19 @@ class RolloverManager:
                 str(new_session_id),
             )
             if visibility_notice.get("status") == "pending_busy":
-                raise RuntimeError("visibility_notice_pending_busy")
+                visibility_notice = {
+                    **visibility_notice,
+                    "status": "deferred_until_first_dispatch_complete",
+                    "deferredAt": now_iso(),
+                }
         except Exception as exc:
-            self._update_current(session_key, {
-                **prepared,
-                "newSessionId": str(new_session_id),
-                "visibilityNotice": {
-                    "status": "pending_retry",
-                    "lastError": str(exc),
-                    "lastAttemptAt": now_iso(),
-                },
-            })
-            raise RuntimeError(f"visibility_notice_failed:{exc}") from exc
+            # The reset has already committed. Visibility is auxiliary and must
+            # not consume the user's triggering message after that point.
+            visibility_notice = {
+                "status": "pending_retry",
+                "lastError": str(exc),
+                "lastAttemptAt": now_iso(),
+            }
         active = self._activation_value(
             prepared={
                 **prepared,
@@ -1034,17 +1200,17 @@ class RolloverManager:
                     str(new_session_id),
                 )
                 if visibility_notice.get("status") == "pending_busy":
-                    continue
+                    visibility_notice = {
+                        **visibility_notice,
+                        "status": "deferred_until_first_dispatch_complete",
+                        "deferredAt": now_iso(),
+                    }
             except Exception as exc:
-                pending = {
-                    **value,
-                    "visibilityNotice": {
-                        "status": "pending_retry",
-                        "lastError": str(exc),
-                        "lastAttemptAt": now_iso(),
-                    },
+                visibility_notice = {
+                    "status": "pending_retry",
+                    "lastError": str(exc),
+                    "lastAttemptAt": now_iso(),
                 }
-                self._update_current(session_key, pending)
                 event = {
                     "ts": now_iso(),
                     "event": "visibility_notice_retry_failed",
@@ -1055,7 +1221,6 @@ class RolloverManager:
                 }
                 append_jsonl(self.events_path, event)
                 recovered.append(event)
-                continue
             active = self._activation_value(
                 prepared={
                     **value,
@@ -1078,6 +1243,107 @@ class RolloverManager:
             append_jsonl(self.events_path, event)
             recovered.append(event)
         return recovered
+
+    def record_first_dispatch_start(
+        self,
+        session_key: str,
+        run_id: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record that the first agent run in the new generation really started."""
+        with self._lock() as acquired:
+            if not acquired:
+                return {"ok": True, "sessionKey": session_key, "action": "lock_busy"}
+            current = read_json(self.current_path, {"sessions": {}})
+            record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
+            if not isinstance(record, dict) or record.get("status") != "active":
+                return {"ok": True, "sessionKey": session_key, "action": "no_active_rollover"}
+            first = record.get("firstDispatch")
+            if not isinstance(first, dict):
+                return {"ok": True, "sessionKey": session_key, "action": "no_pending_first_dispatch"}
+            if session_id and str(record.get("newSessionId") or "") != str(session_id):
+                raise RuntimeError("first_dispatch_generation_mismatch")
+            if first.get("status") == "started" and first.get("runId") == run_id:
+                return {"ok": True, "sessionKey": session_key, "action": "first_dispatch_start_idempotent"}
+            if first.get("status") in {"completed", "failed"}:
+                return {"ok": True, "sessionKey": session_key, "action": "first_dispatch_already_finished"}
+            if first.get("status") != "awaiting_agent_start":
+                raise RuntimeError("first_dispatch_start_state_invalid")
+            started = {
+                **first,
+                "status": "started",
+                "runId": run_id,
+                "startedAt": now_iso(),
+            }
+            self._update_current(session_key, {**record, "firstDispatch": started})
+            event = {
+                "ts": now_iso(),
+                "event": "first_dispatch_started",
+                "sessionKey": session_key,
+                "newSessionId": record.get("newSessionId"),
+                "runId": run_id,
+            }
+            append_jsonl(self.events_path, event)
+            return {"ok": True, "action": "first_dispatch_started", **event}
+
+    def record_first_dispatch_end(
+        self,
+        session_key: str,
+        run_id: str,
+        *,
+        success: bool,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Record completion without persisting prompts, replies, or raw errors."""
+        with self._lock() as acquired:
+            if not acquired:
+                return {"ok": True, "sessionKey": session_key, "action": "lock_busy"}
+            current = read_json(self.current_path, {"sessions": {}})
+            record = current.get("sessions", {}).get(session_key, {}) if isinstance(current, dict) else {}
+            if not isinstance(record, dict) or record.get("status") != "active":
+                return {"ok": True, "sessionKey": session_key, "action": "no_active_rollover"}
+            first = record.get("firstDispatch")
+            if not isinstance(first, dict):
+                return {"ok": True, "sessionKey": session_key, "action": "no_pending_first_dispatch"}
+            if first.get("status") in {"completed", "failed"} and first.get("runId") == run_id:
+                return {"ok": True, "sessionKey": session_key, "action": "first_dispatch_end_idempotent"}
+            if first.get("status") != "started" or first.get("runId") != run_id:
+                raise RuntimeError("first_dispatch_end_state_invalid")
+            finished = {
+                **first,
+                "status": "completed" if success else "failed",
+                "success": success,
+                "finishedAt": now_iso(),
+            }
+            if error_code:
+                finished["errorCode"] = error_code[:120]
+            visibility = record.get("visibilityNotice")
+            if success and isinstance(visibility, dict) and visibility.get("status") in {
+                "deferred_until_first_dispatch_complete",
+                "pending_retry",
+            }:
+                visibility = {
+                    **visibility,
+                    "status": "superseded_by_completed_first_dispatch",
+                    "supersededAt": now_iso(),
+                }
+            self._update_current(session_key, {
+                **record,
+                "firstDispatch": finished,
+                "visibilityNotice": visibility,
+            })
+            event = {
+                "ts": now_iso(),
+                "event": "first_dispatch_completed" if success else "first_dispatch_failed",
+                "sessionKey": session_key,
+                "newSessionId": record.get("newSessionId"),
+                "runId": run_id,
+                "success": success,
+            }
+            if error_code:
+                event["errorCode"] = error_code[:120]
+            append_jsonl(self.events_path, event)
+            return {"ok": True, "action": event["event"], **event}
 
     def _rollover_unlocked(
         self,
@@ -1368,6 +1634,87 @@ class RolloverManager:
                     })
         return results
 
+    def _repair_deferred_visibility_notices(self, *, dry_run: bool) -> list[dict[str, Any]]:
+        """Surface the old outcome only when the first new-generation run did not succeed."""
+        config = self._visible_continuity_config()
+        if not config["enabled"]:
+            return []
+        current = read_json(self.current_path, {"sessions": {}})
+        records = current.get("sessions", {}) if isinstance(current, dict) else {}
+        results: list[dict[str, Any]] = []
+        for session_key, record in records.items():
+            if not isinstance(record, dict) or record.get("status") != "active":
+                continue
+            visibility = record.get("visibilityNotice")
+            first = record.get("firstDispatch")
+            if not isinstance(visibility, dict) or not isinstance(first, dict):
+                continue
+            if visibility.get("status") not in {
+                "deferred_until_first_dispatch_complete",
+                "pending_retry",
+            }:
+                continue
+            first_status = first.get("status")
+            start_age = iso_age_seconds(first.get("armedAt"))
+            start_timed_out = (
+                first_status == "awaiting_agent_start"
+                and start_age is not None
+                and start_age >= int(config["firstDispatchStartTimeoutSeconds"])
+            )
+            if first_status != "failed" and not start_timed_out:
+                continue
+            new_session_id = str(record.get("newSessionId") or "")
+            if not new_session_id:
+                continue
+            try:
+                result = self._ensure_visible_continuity(
+                    session_key,
+                    record,
+                    new_session_id,
+                    dry_run=dry_run,
+                )
+                output = {
+                    "sessionKey": session_key,
+                    "firstDispatchStatus": first_status,
+                    "startTimedOut": start_timed_out,
+                    **result,
+                }
+                results.append(output)
+                if dry_run or result.get("status") != "verified":
+                    continue
+                updated_first = {
+                    **first,
+                    **({"status": "start_timeout"} if start_timed_out else {}),
+                    "continuityNoticeVerifiedAt": now_iso(),
+                }
+                self._update_current(session_key, {
+                    **record,
+                    "firstDispatch": updated_first,
+                    "visibilityNotice": result,
+                })
+                append_jsonl(self.events_path, {
+                    "ts": now_iso(),
+                    "event": "first_dispatch_recovery_notice_verified",
+                    "sessionKey": session_key,
+                    "newSessionId": new_session_id,
+                    "firstDispatchStatus": first_status,
+                    "startTimedOut": start_timed_out,
+                })
+            except Exception as exc:
+                error = {
+                    "sessionKey": session_key,
+                    "status": "repair_error",
+                    "error": str(exc),
+                }
+                results.append(error)
+                if not dry_run:
+                    append_jsonl(self.events_path, {
+                        "ts": now_iso(),
+                        "event": "first_dispatch_recovery_notice_failed",
+                        **error,
+                    })
+        return results
+
     def scan(self, *, dry_run: bool = False) -> dict[str, Any]:
         if not self.config.get("enabled", False):
             return {"ok": True, "enabled": False, "results": []}
@@ -1382,6 +1729,7 @@ class RolloverManager:
         sessions = self._sessions()
         recovered = [] if dry_run else self._reconcile_prepared(sessions)
         visibility_repairs = self._repair_existing_visibility_notices(dry_run=dry_run)
+        deferred_visibility_repairs = self._repair_deferred_visibility_notices(dry_run=dry_run)
         results = []
         for session_key, spec in self.config.get("sessions", {}).items():
                 entry = sessions.get(session_key)
@@ -1557,6 +1905,7 @@ class RolloverManager:
             "dryRun": dry_run,
             "recovered": recovered,
             "visibilityRepairs": visibility_repairs,
+            "deferredVisibilityRepairs": deferred_visibility_repairs,
             "results": results,
         }
         if not dry_run:
@@ -1578,6 +1927,15 @@ def main() -> int:
     activate = sub.add_parser("activate-pending")
     activate.add_argument("--session-key", required=True)
     activate.add_argument("--dry-run", action="store_true")
+    dispatch_start = sub.add_parser("record-first-dispatch-start")
+    dispatch_start.add_argument("--session-key", required=True)
+    dispatch_start.add_argument("--run-id", required=True)
+    dispatch_start.add_argument("--session-id")
+    dispatch_end = sub.add_parser("record-first-dispatch-end")
+    dispatch_end.add_argument("--session-key", required=True)
+    dispatch_end.add_argument("--run-id", required=True)
+    dispatch_end.add_argument("--success", choices=("true", "false"), required=True)
+    dispatch_end.add_argument("--error-code")
     visibility = sub.add_parser("repair-visibility")
     visibility.add_argument("--session-key", required=True)
     visibility.add_argument("--force", action="store_true")
@@ -1592,6 +1950,19 @@ def main() -> int:
             payload = manager.rollover(args.session_key, force=args.force, dry_run=args.dry_run)
         elif args.command == "activate-pending":
             payload = manager.activate_pending(args.session_key, dry_run=args.dry_run)
+        elif args.command == "record-first-dispatch-start":
+            payload = manager.record_first_dispatch_start(
+                args.session_key,
+                args.run_id,
+                args.session_id,
+            )
+        elif args.command == "record-first-dispatch-end":
+            payload = manager.record_first_dispatch_end(
+                args.session_key,
+                args.run_id,
+                success=args.success == "true",
+                error_code=args.error_code,
+            )
         elif args.command == "repair-visibility":
             payload = manager.repair_visibility(
                 args.session_key,

@@ -57,16 +57,27 @@ export function readPendingRollover(statePath, sessionKey) {
   return record;
 }
 
-export async function activatePendingRollover(options, sessionKey) {
+export function readPendingFirstDispatch(statePath, sessionKey) {
+  if (!sessionKey) return null;
+  const record = readJson(statePath, null)?.sessions?.[sessionKey];
+  const firstDispatch = record?.firstDispatch;
+  if (
+    record?.status !== "active"
+    || !record?.newSessionId
+    || !firstDispatch
+    || !["awaiting_agent_start", "started"].includes(firstDispatch.status)
+  ) return null;
+  return { record, firstDispatch };
+}
+
+async function runManagerCommand(options, commandArgs) {
   const { stdout } = await execFileAsync(
     options.pythonPath,
     [
       options.managerScriptPath,
       "--config",
       options.managerConfigPath,
-      "activate-pending",
-      "--session-key",
-      sessionKey,
+      ...commandArgs,
     ],
     {
       encoding: "utf8",
@@ -81,6 +92,52 @@ export async function activatePendingRollover(options, sessionKey) {
   const payload = JSON.parse(stdout);
   if (payload?.ok === false) throw new Error(String(payload.error || "activation_failed"));
   return payload;
+}
+
+export async function activatePendingRollover(options, sessionKey) {
+  return runManagerCommand(options, [
+    "activate-pending",
+    "--session-key",
+    sessionKey,
+  ]);
+}
+
+export async function recordFirstDispatchStart(options, sessionKey, runId, sessionId) {
+  const args = [
+    "record-first-dispatch-start",
+    "--session-key",
+    sessionKey,
+    "--run-id",
+    runId,
+  ];
+  if (sessionId) args.push("--session-id", sessionId);
+  return runManagerCommand(options, args);
+}
+
+export async function recordFirstDispatchEnd(options, sessionKey, runId, success) {
+  const args = [
+    "record-first-dispatch-end",
+    "--session-key",
+    sessionKey,
+    "--run-id",
+    runId,
+    "--success",
+    success ? "true" : "false",
+  ];
+  if (!success) args.push("--error-code", "agent_run_failed");
+  return runManagerCommand(options, args);
+}
+
+async function recordLifecycleWithRetry(operation, attempts = 3) {
+  let lastResult;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    lastResult = await operation();
+    if (lastResult?.action !== "lock_busy") return lastResult;
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+    }
+  }
+  throw new Error(`lifecycle_state_lock_busy_after_${attempts}_attempts`);
 }
 
 export function createDeferredRolloverHook(options, logger, activate = activatePendingRollover) {
@@ -116,6 +173,64 @@ export function createDeferredRolloverHook(options, logger, activate = activateP
   };
 }
 
+export function createFirstDispatchStartHook(
+  options,
+  logger,
+  recordStart = recordFirstDispatchStart,
+) {
+  return async (_event, ctx) => {
+    const sessionKey = String(ctx?.sessionKey || "").trim();
+    const runId = String(ctx?.runId || "").trim();
+    const pending = readPendingFirstDispatch(options.statePath, sessionKey);
+    if (!pending || pending.firstDispatch.status !== "awaiting_agent_start" || !runId) return;
+    try {
+      const result = await recordLifecycleWithRetry(
+        () => recordStart(options, sessionKey, runId, ctx?.sessionId),
+      );
+      if (!["first_dispatch_started", "first_dispatch_start_idempotent", "first_dispatch_already_finished"].includes(result?.action)) {
+        throw new Error(`unexpected_first_dispatch_start_result:${result?.action || "missing"}`);
+      }
+      logger.info?.(
+        `openclaw-session-keeper: first dispatch started session=${sessionKey} run=${runId}`,
+      );
+    } catch (error) {
+      // Observability must never consume a user task after rollover committed.
+      logger.error?.(
+        `openclaw-session-keeper: first dispatch start tracking failed session=${sessionKey}: ${error?.message ?? error}`,
+      );
+    }
+  };
+}
+
+export function createFirstDispatchEndHook(
+  options,
+  logger,
+  recordEnd = recordFirstDispatchEnd,
+) {
+  return async (event, ctx) => {
+    const sessionKey = String(ctx?.sessionKey || "").trim();
+    const runId = String(event?.runId || ctx?.runId || "").trim();
+    const pending = readPendingFirstDispatch(options.statePath, sessionKey);
+    if (!pending || pending.firstDispatch.status !== "started" || !runId) return;
+    if (String(pending.firstDispatch.runId || "") !== runId) return;
+    try {
+      const result = await recordLifecycleWithRetry(
+        () => recordEnd(options, sessionKey, runId, event?.success === true),
+      );
+      if (!["first_dispatch_completed", "first_dispatch_failed", "first_dispatch_end_idempotent"].includes(result?.action)) {
+        throw new Error(`unexpected_first_dispatch_end_result:${result?.action || "missing"}`);
+      }
+      logger.info?.(
+        `openclaw-session-keeper: first dispatch finished session=${sessionKey} run=${runId} success=${event?.success === true}`,
+      );
+    } catch (error) {
+      logger.error?.(
+        `openclaw-session-keeper: first dispatch end tracking failed session=${sessionKey}: ${error?.message ?? error}`,
+      );
+    }
+  };
+}
+
 export default {
   id: "openclaw-session-keeper",
   name: "OpenClaw Session Keeper",
@@ -146,6 +261,14 @@ export default {
       api.on(
         "before_dispatch",
         createDeferredRolloverHook(deferredOptions, api.logger ?? console),
+      );
+      api.on(
+        "before_agent_run",
+        createFirstDispatchStartHook(deferredOptions, api.logger ?? console),
+      );
+      api.on(
+        "agent_end",
+        createFirstDispatchEndHook(deferredOptions, api.logger ?? console),
       );
       api.logger?.info?.("openclaw-session-keeper: deferred rollover hook active");
     }

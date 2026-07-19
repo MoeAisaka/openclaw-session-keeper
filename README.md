@@ -122,10 +122,15 @@ role-agent sessions that must always run in Standard mode.
 `rolloverTiming.deferUntilNextUserMessage` is also opt-in. When enabled, the
 scanner arms normal threshold rollovers without changing the current physical
 session. The plugin's awaited `before_dispatch` hook activates the pending
-rollover and then lets the original inbound task continue in the new session.
-Emergency thresholds and retired Codex-binding recovery remain immediate. The
-hook must point to this repository's manager script, production configuration
-and state file through the plugin's `deferredRollover` settings.
+rollover and then lets the original inbound task continue in the new session. A
+busy operator-visible notice is auxiliary after the reset commits and cannot
+consume that triggering message. The handoff carries a bounded previous
+assistant outcome plus an explicit continuation decision derived from Workflow
+Ledger state and visible turn order. `before_agent_run` and `agent_end` record
+whether the first new-generation run actually started and finished. Emergency
+thresholds and retired Codex-binding recovery remain immediate. The hook must
+point to this repository's manager script, production configuration and state
+file through the plugin's `deferredRollover` settings.
 
 Run a real scan only after the dry run is clean:
 

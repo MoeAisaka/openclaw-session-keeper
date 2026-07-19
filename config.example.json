@@ -17,6 +17,8 @@
     "enabled": true,
     "label": "Session rollover",
     "historyCheckLimit": 200,
+    "lastAssistantOutcomeChars": 6000,
+    "firstDispatchStartTimeoutSeconds": 180,
     "repairExistingSessionKeys": []
   },
   "rolloverTiming": {

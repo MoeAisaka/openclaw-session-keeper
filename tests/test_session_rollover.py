@@ -206,6 +206,74 @@ class RolloverTests(unittest.TestCase):
             current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
             self.assertEqual(current["status"], "active")
             self.assertEqual(current["activationTrigger"], "next_user_message")
+            self.assertEqual(current["firstDispatch"]["status"], "awaiting_agent_start")
+
+    def test_pending_rollover_does_not_consume_triggering_message_when_notice_is_busy(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["visibleContinuity"] = {"enabled": True}
+            handoff_path = root / "handoff.json"
+            messages = [{"role": "assistant", "text": "上一轮已经完成"}]
+            handoff = {
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "label": "测试",
+                "handoffPath": str(handoff_path),
+                "recentMessages": messages,
+                "workflowTasks": [],
+                "continuationDecision": MODULE.continuation_decision(messages, []),
+            }
+            handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+            old_entry = {
+                "sessionId": "old-session",
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            sessions_path = root / "sessions.json"
+            sessions_path.write_text(json.dumps({
+                "agent:main:project-test": old_entry,
+            }), encoding="utf-8")
+            manager._update_current("agent:main:project-test", {
+                "status": "pending_next_user",
+                "sessionKey": "agent:main:project-test",
+                "oldSessionId": "old-session",
+                "label": "测试",
+                "project": "test",
+                "tokens": 270000,
+                "handoffPath": str(handoff_path),
+                "handoffSha256": MODULE.sha256_file(handoff_path),
+                "continuityContext": "verified",
+            })
+
+            def gateway_reset(_session_key):
+                new_entry = {
+                    **old_entry,
+                    "sessionId": "new-session",
+                    "totalTokens": 0,
+                    "status": "running",
+                }
+                sessions_path.write_text(json.dumps({
+                    "agent:main:project-test": new_entry,
+                }), encoding="utf-8")
+                return {"ok": True, "key": "agent:main:project-test", "entry": new_entry}
+
+            with patch.object(manager, "_gateway_reset", side_effect=gateway_reset), patch.object(
+                manager, "_history_contains_notice", return_value=False
+            ):
+                result = manager.activate_pending("agent:main:project-test")
+            self.assertEqual(result["action"], "pending_rollover_activated")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["status"], "active")
+            self.assertEqual(
+                current["visibilityNotice"]["status"],
+                "deferred_until_first_dispatch_complete",
+            )
+            self.assertEqual(current["firstDispatch"]["status"], "awaiting_agent_start")
 
     def test_activate_pending_is_idempotent_when_nothing_is_armed(self):
         with tempfile.TemporaryDirectory() as value:
@@ -453,7 +521,11 @@ class RolloverTests(unittest.TestCase):
             "sessionKey": "agent:main:project-test",
             "oldSessionId": "old-session",
             "handoffPath": "/tmp/handoff.json",
-            "recentMessages": [{"role": "user", "text": "secret-value"}],
+            "recentMessages": [
+                {"role": "user", "text": "secret-value"},
+                {"role": "assistant", "text": "最终结论：任务已完成"},
+            ],
+            "workflowTasks": [],
         }
         notice = MODULE.render_visible_continuity_notice(handoff, "new-session")
         self.assertIn("会话已安全换代", notice)
@@ -462,6 +534,8 @@ class RolloverTests(unittest.TestCase):
         self.assertIn("/tmp/handoff.json", notice)
         self.assertIn(MODULE.continuity_notice_marker("old-session", "new-session"), notice)
         self.assertNotIn("secret-value", notice)
+        self.assertIn("最终结论：任务已完成", notice)
+        self.assertIn("自动续跑：否", notice)
 
     def test_visible_notice_uses_chat_inject_and_reads_marker_back(self):
         with tempfile.TemporaryDirectory() as value:
@@ -590,7 +664,7 @@ class RolloverTests(unittest.TestCase):
             self.assertEqual(result["status"], "pending_busy")
             self.assertEqual(gateway.call_count, 1)
 
-    def test_reconcile_keeps_prepared_state_when_visible_notice_fails(self):
+    def test_reconcile_activates_generation_when_only_visible_notice_fails(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             manager = self.make_manager(root)
@@ -624,8 +698,9 @@ class RolloverTests(unittest.TestCase):
             self.assertEqual(recovered[0]["event"], "visibility_notice_retry_failed")
             current = MODULE.read_json(manager.current_path, {})
             record = current["sessions"]["agent:main:project-test"]
-            self.assertEqual(record["status"], "prepared")
+            self.assertEqual(record["status"], "active")
             self.assertEqual(record["visibilityNotice"]["status"], "pending_retry")
+            self.assertEqual(record["firstDispatch"]["status"], "awaiting_agent_start")
 
     def test_scan_auto_repairs_allowlisted_existing_rollover_once(self):
         with tempfile.TemporaryDirectory() as value:
@@ -673,6 +748,41 @@ class RolloverTests(unittest.TestCase):
             ensure_again.assert_not_called()
             self.assertEqual(payload["visibilityRepairs"][0]["status"], "already_verified")
 
+    def test_failed_first_dispatch_repairs_previous_outcome_notice(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager.config["visibleContinuity"] = {"enabled": True}
+            manager._update_current("agent:main:project-test", {
+                "status": "active",
+                "oldSessionId": "old-session",
+                "newSessionId": "new-session",
+                "handoffPath": "/tmp/handoff.json",
+                "visibilityNotice": {"status": "deferred_until_first_dispatch_complete"},
+                "firstDispatch": {
+                    "status": "failed",
+                    "runId": "run-1",
+                    "armedAt": MODULE.now_iso(),
+                },
+            })
+            verified = {
+                "status": "verified",
+                "verification": "injected_and_read_back",
+                "marker": "marker",
+            }
+            with patch.object(
+                manager, "_ensure_visible_continuity", return_value=verified
+            ) as ensure:
+                results = manager._repair_deferred_visibility_notices(dry_run=False)
+            ensure.assert_called_once()
+            self.assertEqual(results[0]["status"], "verified")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["visibilityNotice"], verified)
+            self.assertEqual(
+                current["firstDispatch"]["continuityNoticeVerifiedAt"][:10],
+                MODULE.now_iso()[:10],
+            )
+
     def test_manual_visibility_repair_live_path_returns_event(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
@@ -711,11 +821,79 @@ class RolloverTests(unittest.TestCase):
             "workflowTasks": [],
             "memories": [],
             "paths": [],
-            "recentMessages": [{"role": "user", "text": "x" * 5000}],
+            "recentMessages": [
+                {"role": "user", "text": "x" * 5000},
+                {"role": "assistant", "text": "FINAL-SENTINEL-RESULT" + ("y" * 5000)},
+            ],
         }
         context = MODULE.render_continuity_context(handoff, 1000)
         self.assertLessEqual(len(context), 1000)
         self.assertIn("handoff_file", context)
+        self.assertIn("FINAL-SENTINEL-RESULT", context)
+
+    def test_continuation_decision_uses_ledger_before_free_form_turn_order(self):
+        replied = [{"role": "assistant", "text": "已完成"}]
+        idle = MODULE.continuation_decision(replied, [])
+        self.assertEqual(idle["action"], "await_current_user_request")
+        self.assertFalse(idle["shouldAutoContinue"])
+
+        active = MODULE.continuation_decision(replied, [{
+            "task_id": "task-1",
+            "status": "in_progress",
+        }])
+        self.assertEqual(active["action"], "resume_registered_work")
+        self.assertTrue(active["shouldAutoContinue"])
+
+        blocked = MODULE.continuation_decision(replied, [{
+            "task_id": "task-2",
+            "status": "blocked",
+        }])
+        self.assertEqual(blocked["action"], "report_registered_blocker")
+        self.assertFalse(blocked["shouldAutoContinue"])
+
+    def test_first_dispatch_start_and_end_are_idempotent(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            manager._update_current("agent:main:project-test", {
+                "status": "active",
+                "newSessionId": "new-session",
+                "visibilityNotice": {"status": "deferred_until_first_dispatch_complete"},
+                "firstDispatch": {
+                    "status": "awaiting_agent_start",
+                    "newSessionId": "new-session",
+                },
+            })
+            started = manager.record_first_dispatch_start(
+                "agent:main:project-test",
+                "run-1",
+                "new-session",
+            )
+            self.assertEqual(started["action"], "first_dispatch_started")
+            duplicate_start = manager.record_first_dispatch_start(
+                "agent:main:project-test",
+                "run-1",
+                "new-session",
+            )
+            self.assertEqual(duplicate_start["action"], "first_dispatch_start_idempotent")
+            finished = manager.record_first_dispatch_end(
+                "agent:main:project-test",
+                "run-1",
+                success=True,
+            )
+            self.assertEqual(finished["action"], "first_dispatch_completed")
+            duplicate_end = manager.record_first_dispatch_end(
+                "agent:main:project-test",
+                "run-1",
+                success=True,
+            )
+            self.assertEqual(duplicate_end["action"], "first_dispatch_end_idempotent")
+            current = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(current["firstDispatch"]["status"], "completed")
+            self.assertEqual(
+                current["visibilityNotice"]["status"],
+                "superseded_by_completed_first_dispatch",
+            )
 
     def test_dry_run_checkpoint_does_not_create_state(self):
         with tempfile.TemporaryDirectory() as value:
