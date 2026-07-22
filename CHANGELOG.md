@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-22
+
+### Fixed
+
+- Normalize thinking levels to `off` before writing preferences to Claude runtimes (`claude-cli` provider or `claude-*` models), covering both user model-override inheritance and project default fallback during rollover; each normalization is recorded with its original value in the events log. OpenAI/Codex runtime behavior and rollover thresholds are unchanged.
+
 ## [0.3.3] - 2026-07-19
 
 ### Fixed

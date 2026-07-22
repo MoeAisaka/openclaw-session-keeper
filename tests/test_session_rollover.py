@@ -1389,6 +1389,197 @@ class RolloverTests(unittest.TestCase):
             self.assertIsNone(repaired_entry["thinkingLevel"])
             self.assertEqual(repaired_entry["fastMode"], False)
 
+    def test_claude_default_model_normalizes_default_xhigh_to_off(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            spec = manager.config["sessions"]["agent:main:project-test"]
+            entry = {
+                "sessionId": "session",
+                "modelProvider": "claude-cli",
+                "model": "claude-fable-5",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            self.assertEqual(manager._desired_preferences(spec, entry), {
+                "thinkingLevel": "off",
+                "fastMode": False,
+            })
+
+            def gateway_call(method, params):
+                self.assertEqual(method, "sessions.patch")
+                self.assertEqual(params["thinkingLevel"], "off")
+                return {"ok": True, "entry": {**entry, **params}}
+
+            with patch.object(manager, "_gateway_call", side_effect=gateway_call):
+                repaired_entry, repaired = manager._ensure_preferences(
+                    "agent:main:project-test", spec, entry
+                )
+            self.assertTrue(repaired)
+            self.assertEqual(repaired_entry["thinkingLevel"], "off")
+            events = [
+                json.loads(line)
+                for line in manager.events_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event"], "thinking_level_normalized")
+            self.assertEqual(events[0]["originalValue"], "xhigh")
+            self.assertEqual(events[0]["normalizedValue"], "off")
+            self.assertEqual(events[0]["runtime"], "claude-cli/claude-fable-5")
+
+    def test_claude_user_model_override_normalizes_inherited_thinking(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            spec = manager.config["sessions"]["agent:main:project-test"]
+            entry = {
+                "sessionId": "session",
+                "providerOverride": "claude-cli",
+                "modelOverride": "claude-fable-5",
+                "modelOverrideSource": "user",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            self.assertEqual(manager._desired_preferences(spec, entry), {
+                "thinkingLevel": "off",
+                "fastMode": False,
+            })
+
+    def test_claude_explicit_off_thinking_is_preserved(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            spec = {
+                "label": "Claude project",
+                "project": "claude",
+                "query": "claude",
+                "preferences": {"thinkingLevel": "off", "fastMode": False},
+            }
+            entry = {
+                "sessionId": "session",
+                "modelProvider": "claude-cli",
+                "model": "claude-fable-5",
+                "thinkingLevel": "off",
+                "fastMode": False,
+            }
+            self.assertEqual(manager._desired_preferences(spec, entry), {
+                "thinkingLevel": "off",
+                "fastMode": False,
+            })
+            with patch.object(manager, "_gateway_call") as gateway_call:
+                repaired_entry, repaired = manager._ensure_preferences(
+                    "agent:main:project-test", spec, entry
+                )
+            gateway_call.assert_not_called()
+            self.assertFalse(repaired)
+            self.assertEqual(repaired_entry["thinkingLevel"], "off")
+            self.assertFalse(manager.events_path.exists())
+
+    def test_openai_session_keeps_xhigh_thinking(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            spec = manager.config["sessions"]["agent:main:project-test"]
+            entry = {
+                "sessionId": "session",
+                "modelProvider": "openai",
+                "model": "gpt-5-codex",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            self.assertEqual(manager._desired_preferences(spec, entry), {
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            })
+            with patch.object(manager, "_gateway_call") as gateway_call:
+                repaired_entry, repaired = manager._ensure_preferences(
+                    "agent:main:project-test", spec, entry
+                )
+            gateway_call.assert_not_called()
+            self.assertFalse(repaired)
+            self.assertEqual(repaired_entry["thinkingLevel"], "xhigh")
+            self.assertFalse(manager.events_path.exists())
+
+    def test_rollover_normalizes_claude_default_thinking_for_new_session(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            manager = self.make_manager(root)
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "message", "message": {"role": "user", "content": "继续处理"}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            store_path = root / "sessions.json"
+            old_entry = {
+                "sessionId": "old-session",
+                "sessionFile": str(transcript),
+                "totalTokens": 270000,
+                "status": "done",
+                "updatedAt": 0,
+                "label": "测试",
+                "modelProvider": "claude-cli",
+                "model": "claude-fable-5",
+                "thinkingLevel": "xhigh",
+                "fastMode": False,
+            }
+            store_path.write_text(json.dumps({
+                "agent:main:project-test": old_entry
+            }), encoding="utf-8")
+            handoff_path = root / "handoff.json"
+            handoff_path.write_text("{}\n", encoding="utf-8")
+            handoff = {
+                "handoffPath": str(handoff_path),
+                "continuityContext": "verified handoff",
+            }
+
+            def gateway_call(method, params):
+                self.assertEqual(method, "sessions.patch")
+                self.assertEqual(params["thinkingLevel"], "off")
+                store = json.loads(store_path.read_text(encoding="utf-8"))
+                store["agent:main:project-test"].update(
+                    {key: value for key, value in params.items() if key != "key"}
+                )
+                store_path.write_text(json.dumps(store), encoding="utf-8")
+                return {"ok": True, "entry": dict(store["agent:main:project-test"])}
+
+            def gateway_reset(_session_key):
+                store = json.loads(store_path.read_text(encoding="utf-8"))
+                new_entry = {
+                    **store["agent:main:project-test"],
+                    "sessionId": "new-session",
+                    "totalTokens": 0,
+                    "thinkingLevel": None,
+                }
+                store["agent:main:project-test"] = new_entry
+                store_path.write_text(json.dumps(store), encoding="utf-8")
+                return {"ok": True, "key": "agent:main:project-test", "entry": new_entry}
+
+            with patch.object(manager, "_handoff", return_value=handoff), patch.object(
+                manager, "_gateway_call", side_effect=gateway_call
+            ), patch.object(manager, "_gateway_reset", side_effect=gateway_reset):
+                result = manager.rollover("agent:main:project-test")
+            self.assertEqual(result["event"], "rollover_completed")
+            self.assertEqual(result["thinkingLevel"], "off")
+            self.assertEqual(result["thinkingNormalization"]["originalValue"], "xhigh")
+            self.assertEqual(result["thinkingNormalization"]["normalizedValue"], "off")
+            self.assertEqual(
+                result["thinkingNormalization"]["runtime"], "claude-cli/claude-fable-5"
+            )
+            store = json.loads(store_path.read_text(encoding="utf-8"))
+            self.assertEqual(store["agent:main:project-test"]["thinkingLevel"], "off")
+            record = MODULE.read_json(manager.current_path, {})["sessions"]["agent:main:project-test"]
+            self.assertEqual(record["sessionPreferences"], {
+                "thinkingLevel": "off",
+                "fastMode": False,
+            })
+            events = [
+                json.loads(line)
+                for line in manager.events_path.read_text(encoding="utf-8").splitlines()
+            ]
+            normalized = [item for item in events if item["event"] == "thinking_level_normalized"]
+            self.assertEqual(len(normalized), 1)
+            self.assertEqual(normalized[0]["originalValue"], "xhigh")
+
 
 if __name__ == "__main__":
     unittest.main()
