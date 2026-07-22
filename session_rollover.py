@@ -37,6 +37,8 @@ PATH_RE = re.compile(
     r"(?P<path>(?:(?:/Users/|/home/|~/)[^\s\]\)>'\"]+|[A-Za-z]:\\[^\s\]\)>'\"]+))"  # secret-scan: allow
 )
 VALID_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"}
+# Claude runtimes (claude-cli / claude-* models) reject staged thinking levels.
+CLAUDE_SAFE_THINKING_LEVELS = {None, "off"}
 VALID_FAST_MODES = {True, False, "auto"}
 DEFAULT_VISIBLE_CONTINUITY = {
     "enabled": False,
@@ -587,11 +589,52 @@ class RolloverManager:
             return None
         return {"providerOverride": provider, "modelOverride": model}
 
+    @staticmethod
+    def _claude_runtime_target(entry: dict[str, Any] | None) -> str | None:
+        """Resolve the session's effective model target when it runs on a Claude runtime."""
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("providerOverride") or entry.get("modelOverride"):
+            provider = str(entry.get("providerOverride") or "").strip().lower()
+            model = str(entry.get("modelOverride") or "").strip().lower()
+        else:
+            provider = str(entry.get("modelProvider") or "").strip().lower()
+            model = str(entry.get("model") or "").strip().lower()
+        if provider and model.startswith(f"{provider}/"):
+            model = model[len(provider) + 1 :].strip()
+        if not (provider.startswith("claude") or model.startswith("claude")):
+            return None
+        return f"{provider}/{model}" if provider and model else provider or model
+
+    def _normalize_claude_thinking(
+        self,
+        desired: dict[str, Any],
+        entry: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Claude runtimes only accept thinking off; never write staged levels to them."""
+        runtime = self._claude_runtime_target(entry)
+        if runtime is None or desired.get("thinkingLevel") in CLAUDE_SAFE_THINKING_LEVELS:
+            return desired, None
+        return {**desired, "thinkingLevel": "off"}, {
+            "field": "thinkingLevel",
+            "originalValue": desired.get("thinkingLevel"),
+            "normalizedValue": "off",
+            "runtime": runtime,
+            "reason": "claude_runtime_thinking_must_be_off",
+        }
+
     def _desired_preferences(
         self,
         spec: dict[str, Any],
         entry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        return self._desired_preferences_normalized(spec, entry)[0]
+
+    def _desired_preferences_normalized(
+        self,
+        spec: dict[str, Any],
+        entry: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         preferences = {
             **self.config.get("sessionPreferences", {}),
             **spec.get("preferences", {}),
@@ -611,7 +654,7 @@ class RolloverManager:
         desired: dict[str, Any] = {"fastMode": fast_mode}
         if "thinkingLevel" in preferences:
             desired["thinkingLevel"] = thinking_level
-        return desired
+        return self._normalize_claude_thinking(desired, entry)
 
     @staticmethod
     def _preferences_match(entry: dict[str, Any], desired: dict[str, Any]) -> bool:
@@ -837,9 +880,19 @@ class RolloverManager:
         current = entry if isinstance(entry, dict) else self._sessions().get(session_key, {})
         if not isinstance(current, dict):
             raise RuntimeError("session_entry_missing")
-        expected = dict(desired) if isinstance(desired, dict) else self._desired_preferences(spec, current)
+        if isinstance(desired, dict):
+            expected, normalization = self._normalize_claude_thinking(dict(desired), current)
+        else:
+            expected, normalization = self._desired_preferences_normalized(spec, current)
         repaired = False
         if not self._preferences_match(current, expected):
+            if normalization is not None:
+                append_jsonl(self.events_path, {
+                    "ts": now_iso(),
+                    "event": "thinking_level_normalized",
+                    "sessionKey": session_key,
+                    **normalization,
+                })
             payload = self._gateway_call("sessions.patch", {"key": session_key, **expected})
             patched = payload.get("entry")
             current = patched if isinstance(patched, dict) else self._sessions().get(session_key, {})
@@ -1442,7 +1495,7 @@ class RolloverManager:
             else {}
         )
         entry, preferences_repaired_before_reset = self._ensure_preferences(session_key, spec, entry)
-        desired_preferences_before_reset = self._desired_preferences(spec, entry)
+        desired_preferences_before_reset, thinking_normalization = self._desired_preferences_normalized(spec, entry)
         manual_selection_before_reset = self._manual_model_selection(entry)
         handoff = self._handoff(session_key, spec, entry)
         old_session_id = entry["sessionId"]
@@ -1555,6 +1608,7 @@ class RolloverManager:
             "trigger": trigger_override or decision["reason"],
             "physicalAgeDaysBefore": decision["physicalAgeDays"],
             "thinkingLevel": refreshed.get("thinkingLevel"),
+            "thinkingNormalization": thinking_normalization,
             "fastMode": refreshed.get("fastMode"),
             "providerOverride": refreshed.get("providerOverride"),
             "modelOverride": refreshed.get("modelOverride"),
